@@ -1,0 +1,43 @@
+#pragma code_page(65001)
+#include <windows.h>
+#include "settings.h"
+#include "version.h"
+IDI_APP ICON "assets/myzoomit.ico"
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "MyZoomIt screen annotation"
+            VALUE "FileVersion", MYZOOMIT_VERSION
+            VALUE "ProductName", "MyZoomIt"
+            VALUE "ProductVersion", MYZOOMIT_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
+IDD_SETTINGS DIALOGEX 0, 0, 364, 340
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "MyZoomIt v1.0 设置"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT "标注快捷键", -1, 10, 14, 70, 12
+    CONTROL "", IDC_HOTKEY, "msctls_hotkey32", WS_TABSTOP | WS_BORDER, 86, 10, 134, 18
+    PUSHBUTTON "删除", IDC_DELETE_HOTKEY, 228, 10, 48, 18
+    PUSHBUTTON "恢复默认", IDC_RESET, 284, 10, 70, 18
+    LTEXT "按 Ctrl / Alt 组合键设置；删除后保存可停用快捷键。", -1, 10, 34, 344, 12
+    GROUPBOX "操作说明", IDC_INSTRUCTION_GROUP, 10, 54, 344, 234
+    LTEXT "", IDC_INSTRUCTIONS, 20, 68, 324, 210
+    AUTOCHECKBOX "显示悬浮状态菜单", IDC_SHOW_HINT, 10, 296, 160, 14
+    AUTOCHECKBOX "开机自动运行", IDC_STARTUP, 194, 296, 160, 14
+    DEFPUSHBUTTON "保存", IDOK, 232, 318, 56, 20
+    PUSHBUTTON "取消", IDCANCEL, 298, 318, 56, 20
+END

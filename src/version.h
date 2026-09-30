@@ -1,0 +1,2 @@
+#define MYZOOMIT_VERSION "1.0"
+#define MYZOOMIT_VERSION_W L"1.0"

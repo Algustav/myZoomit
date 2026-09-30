@@ -1,0 +1,4 @@
+#define IDD_SETTINGS 101
+#define IDC_HOTKEY 1001
+#define IDC_RESET 1002
+#define IDC_ERROR 1003
