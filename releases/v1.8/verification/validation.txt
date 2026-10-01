@@ -1,0 +1,1 @@
+Release build completed. Per user request, no functional, UI, automated or archive verification performed for v1.8.

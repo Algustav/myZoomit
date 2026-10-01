@@ -1,1 +1,0 @@
-Release build completed. Drawing and UI behavior confirmed manually by the user during development; no automated or desktop drawing tests performed for packaging.

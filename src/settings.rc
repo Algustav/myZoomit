@@ -4,8 +4,8 @@
 #include "version.h"
 IDI_APP ICON "assets/myzoomit.ico"
 1 VERSIONINFO
-FILEVERSION 1,7,0,0
-PRODUCTVERSION 1,7,0,0
+FILEVERSION 1,8,0,0
+PRODUCTVERSION 1,8,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -26,7 +26,7 @@ BEGIN
 END
 IDD_SETTINGS DIALOGEX 0, 0, 280, 364
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "MyZoomIt v1.7 设置"
+CAPTION "MyZoomIt v1.8 设置"
 FONT 9, "Segoe UI"
 BEGIN
     LTEXT "快捷键", -1, 10, 14, 38, 12
@@ -53,6 +53,6 @@ BEGIN
     CONTROL "联系：<a href=""mailto:mail@ganlei.com"">mail@ganlei.com</a>", IDC_CONTACT_LINK, "SysLink", WS_TABSTOP, 20, 64, 224, 12
     LTEXT "语言：C++     协议：MIT", -1, 20, 76, 224, 12
     CONTROL "致谢：<a href=""https://github.com/steveruizok/perfect-freehand"">https://github.com/steveruizok/perfect-freehand</a>", IDC_CREDITS_LINK, "SysLink", WS_TABSTOP, 20, 92, 224, 12
-    LTEXT "by algustav & codex 2026", -1, 20, 108, 224, 12, SS_NOPREFIX
+    LTEXT "by 甘磊 & codex 2026", -1, 20, 108, 224, 12, SS_NOPREFIX
     DEFPUSHBUTTON "关闭", IDOK, 198, 130, 56, 18
 END
