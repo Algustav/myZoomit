@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <array>
 #include <vector>
+#include <memory>
 
 using namespace winrt;
 using namespace Windows::UI;
@@ -43,6 +44,7 @@ namespace XamlInput = Windows::UI::Xaml::Input;
 constexpr wchar_t ClassName[] = L"MyZoomIt.Overlay.v1";
 constexpr UINT TrayMessage = WM_APP + 1, ActivateMessage = WM_APP + 2;
 constexpr UINT SettingsMessage = WM_APP + 3, SettingsReadyMessage = WM_APP + 4;
+constexpr UINT AboutMessage = WM_APP + 5;
 HICON appIcon(bool smallIcon) {
     return static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(IDI_APP),IMAGE_ICON,
         GetSystemMetrics(smallIcon ? SM_CXSMICON : SM_CXICON),
@@ -77,9 +79,11 @@ class App {
     DesktopWindowXamlSource source{nullptr};
     com_ptr<IDesktopWindowXamlSourceNative2> native;
     InkCanvas canvas{nullptr};
+    Border blackboard{nullptr};
     InkPresenter presenter{nullptr};
     Windows::UI::Input::Inking::Core::CoreInkIndependentInputSource inkInput{nullptr};
     enum class Tool { Pen, Rectangle, Ellipse, Line, Arrow };
+    static constexpr float ShapeWidthScale=0.6f;
     Tool tool{Tool::Pen};
     Tool requestedTool{Tool::Pen};
     bool heldTool{};
@@ -90,6 +94,11 @@ class App {
     Windows::Foundation::Point shapeStart{}, shapeEnd{};
     InkDrawingAttributes shapeAttributes{nullptr};
     bool drawingFreehand{};
+    bool eraserMode{}, erasing{};
+    uint32_t eraserPointer{};
+    Windows::Foundation::Point eraserPosition{}, eraserPrevious{};
+    bool cursorTouch{};
+    static constexpr float EraserDiameter=12;
     uint32_t freehandPointer{};
     Windows::Devices::Input::PointerDeviceType freehandDevice{Windows::Devices::Input::PointerDeviceType::Mouse};
     Canvas freehandSurface{nullptr};
@@ -106,8 +115,122 @@ class App {
     struct UndoItem {
         uint32_t inkId{};
         Canvas freehandStroke{nullptr};
+        InkStroke inkSnapshot{nullptr};
+        uint64_t sequence{};
+        std::shared_ptr<std::vector<std::vector<Windows::Foundation::Point>>> contours;
     };
     std::vector<UndoItem> drawingOrder;
+    struct Edit { bool added{}; std::vector<UndoItem> items; };
+    std::vector<Edit> undoHistory, redoHistory;
+    std::vector<UndoItem> erasedItems;
+    uint64_t nextSequence{};
+    std::shared_ptr<std::vector<std::vector<Windows::Foundation::Point>>> liveContours;
+    size_t frozenContourCount{};
+
+    void recordEdit(Edit edit) {
+        if (edit.items.empty()) return;
+        undoHistory.push_back(std::move(edit)); redoHistory.clear();
+    }
+    void rememberInk(InkStroke const& stroke) {
+        UndoItem item; item.inkId=stroke.Id(); item.inkSnapshot=stroke.Clone(); item.sequence=++nextSequence;
+        drawingOrder.push_back(item); recordEdit({true,{item}});
+    }
+    void removeItem(UndoItem const& item) {
+        if (item.freehandStroke) {
+            uint32_t index{};
+            if (freehandSurface.Children().IndexOf(item.freehandStroke,index)) freehandSurface.Children().RemoveAt(index);
+        } else {
+            auto container=presenter.StrokeContainer();
+            for (auto const& stroke:container.GetStrokes()) stroke.Selected(stroke.Id()==item.inkId);
+            container.DeleteSelected();
+        }
+    }
+    void applyEdit(Edit const& edit, bool restore) {
+        bool restoreInk=false;
+        for (auto const& saved:edit.items) {
+            if (!restore) {
+                auto found=std::find_if(drawingOrder.begin(),drawingOrder.end(),[&](auto const& item) { return item.sequence==saved.sequence; });
+                if (found!=drawingOrder.end()) { removeItem(*found); drawingOrder.erase(found); }
+            } else {
+                auto item=saved;
+                if (item.freehandStroke) {
+                    uint32_t index=0;
+                    for (auto const& existing:drawingOrder)
+                        if (existing.freehandStroke && existing.sequence<item.sequence) ++index;
+                    freehandSurface.Children().InsertAt(index,item.freehandStroke);
+                } else {
+                    restoreInk=true;
+                }
+                auto at=std::lower_bound(drawingOrder.begin(),drawingOrder.end(),item.sequence,
+                    [](auto const& existing,uint64_t sequence) { return existing.sequence<sequence; });
+                drawingOrder.insert(at,item);
+            }
+        }
+        if (restoreInk) {
+            // Clone first: a stroke cannot belong to two containers. Reinsert native
+            // strokes in their original drawing order after restoring an earlier one.
+            std::vector<InkStroke> prepared;
+            for (auto const& item:drawingOrder) if (item.inkSnapshot) prepared.push_back(item.inkSnapshot.Clone());
+            auto container=presenter.StrokeContainer(); container.Clear();
+            size_t index=0;
+            for (auto& item:drawingOrder) if (item.inkSnapshot) {
+                auto stroke=prepared[index++]; stroke.Selected(false); container.AddStroke(stroke); item.inkId=stroke.Id();
+            }
+        }
+    }
+    static float pointDistance(Windows::Foundation::Point p,Windows::Foundation::Point a,Windows::Foundation::Point b) {
+        float dx=b.X-a.X,dy=b.Y-a.Y,denominator=dx*dx+dy*dy;
+        float t=denominator>0 ? std::clamp(((p.X-a.X)*dx+(p.Y-a.Y)*dy)/denominator,0.0f,1.0f) : 0;
+        return std::hypot(p.X-a.X-t*dx,p.Y-a.Y-t*dy);
+    }
+    bool eraserHits(UndoItem const& item,Windows::Foundation::Point p) {
+        if (item.contours) {
+            for (auto const& polygon:*item.contours) {
+                int winding=0;
+                for (size_t i=0;i<polygon.size();++i) {
+                    auto a=polygon[i],b=polygon[(i+1)%polygon.size()];
+                    if (pointDistance(p,a,b)<=EraserDiameter/2) return true;
+                    float side=(b.X-a.X)*(p.Y-a.Y)-(p.X-a.X)*(b.Y-a.Y);
+                    if (a.Y<=p.Y && b.Y>p.Y && side>0) ++winding;
+                    if (a.Y>p.Y && b.Y<=p.Y && side<0) --winding;
+                }
+                if (winding) return true;
+            }
+        } else if (item.inkSnapshot) {
+            auto points=item.inkSnapshot.GetInkPoints();
+            float radius=EraserDiameter/2+item.inkSnapshot.DrawingAttributes().Size().Width/2;
+            for (uint32_t i=0;i<points.Size();++i) {
+                auto a=points.GetAt(i).Position(),b=points.GetAt(i ? i-1 : i).Position();
+                if (pointDistance(p,a,b)<=radius) return true;
+            }
+        }
+        return false;
+    }
+    void eraseTo(Windows::Foundation::Point point) {
+        float length=std::hypot(point.X-eraserPrevious.X,point.Y-eraserPrevious.Y);
+        int steps=std::max(1,static_cast<int>(std::ceil(length/3)));
+        for (size_t i=drawingOrder.size();i>0;--i) {
+            auto const& item=drawingOrder[i-1]; bool hit=false;
+            for (int j=0;j<=steps && !hit;++j) {
+                float t=static_cast<float>(j)/steps;
+                hit=eraserHits(item,{eraserPrevious.X+t*(point.X-eraserPrevious.X),eraserPrevious.Y+t*(point.Y-eraserPrevious.Y)});
+            }
+            if (hit) { removeItem(item); erasedItems.push_back(item); drawingOrder.erase(drawingOrder.begin()+i-1); }
+        }
+        eraserPrevious=eraserPosition=point; positionCursor();
+    }
+    void finishErase() {
+        if (!erasing) return;
+        erasing=false; recordEdit({false,std::move(erasedItems)}); erasedItems.clear();
+        if (freehandInputRoot) freehandInputRoot.ReleasePointerCaptures();
+        refreshCursor(penWidth);
+    }
+    void toggleEraser() {
+        cancelFreehand(); finishErase();
+        if (tool!=Tool::Pen) setTool(Tool::Pen);
+        eraserMode=!eraserMode; cursorAnimating=false; cursorTouch=false;
+        refreshCursor(penWidth); updateHint();
+    }
 
     void cancelFreehand() {
         if (!drawingFreehand) return;
@@ -116,7 +239,7 @@ class App {
             uint32_t index{};
             if (freehandSurface.Children().IndexOf(liveFreehandStroke,index)) freehandSurface.Children().RemoveAt(index);
         }
-        liveFreehandPath=nullptr; liveFreehandStroke=nullptr; freehandSamples.clear(); freehandTail.clear();
+        liveFreehandPath=nullptr; liveFreehandStroke=nullptr; freehandSamples.clear(); freehandTail.clear(); liveContours.reset();
         if (freehandInputRoot) freehandInputRoot.ReleasePointerCaptures();
     }
     void addFreehandSample(Windows::UI::Input::PointerPoint const& point) {
@@ -162,6 +285,12 @@ class App {
         auto now=GetTickCount64();
         if (!finishing && freehandLastRender && now-freehandLastRender<8 && freehandTail.size()<258) return;
         freehandLastRender=now;
+        liveContours->resize(frozenContourCount);
+        auto saveContour=[this](auto const& vertices) {
+            std::vector<Windows::Foundation::Point> points; points.reserve(vertices.size());
+            for (auto const& point:vertices) points.push_back({point.x,point.y});
+            liveContours->push_back(std::move(points));
+        };
         float widthScale=freehandDevice==Windows::Devices::Input::PointerDeviceType::Mouse ? 0.8f : 1.0f;
         // Freeze bounded portions. Keep a shared endpoint and its incoming pressure.
         // Frozen Paths do not change; only the live tail is tessellated again.
@@ -169,6 +298,7 @@ class App {
         while (freehandTail.size()>=258) {
             std::vector<freehand::Point> chunk(freehandTail.begin(),freehandTail.begin()+256);
             auto result=freehand::outline(chunk,freehandStrokeWidth,freehandPressureSeed,widthScale);
+            saveContour(result.vertices); ++frozenContourCount;
             PathGeometry frozenGeometry; frozenGeometry.FillRule(FillRule::Nonzero);
             frozenGeometry.Figures().Append(freehandFigure(result.vertices));
             Windows::UI::Xaml::Shapes::Path frozen;
@@ -198,6 +328,7 @@ class App {
             last.runningLength=prior.runningLength+last.distance;
         }
         auto result=freehand::outline(tail,freehandStrokeWidth,freehandPressureSeed,widthScale);
+        saveContour(result.vertices);
         PathGeometry geometry; geometry.FillRule(FillRule::Nonzero);
         geometry.Figures().Append(freehandFigure(result.vertices));
         liveFreehandPath.Data(geometry);
@@ -214,15 +345,22 @@ class App {
                 bool isTouch=device==Windows::Devices::Input::PointerDeviceType::Touch;
                 if (!active || tool!=Tool::Pen || (!isMouse && !isTouch)) return;
                 // One active freehand pointer; extra fingers must not start another stroke.
-                if (drawingFreehand) { args.Handled(true); return; }
+                if (drawingFreehand || erasing) { args.Handled(true); return; }
                 if ((isMouse && !point.Properties().IsLeftButtonPressed()) ||
                     (isTouch && !point.IsInContact())) return;
                 if (!freehandInputRoot.CapturePointer(args.Pointer())) return;
                 freehandDevice=device;
+                cursorTouch=isTouch;
+                if (eraserMode) {
+                    cursorAnimating=false; erasing=true; eraserPointer=args.Pointer().PointerId();
+                    erasedItems.clear(); eraserPrevious=eraserPosition=point.Position();
+                    refreshCursor(penWidth); eraseTo(point.Position()); args.Handled(true); return;
+                }
                 finishCursorAnimation(); drawingFreehand=true; freehandPointer=args.Pointer().PointerId();
                 freehandStrokeWidth=penWidth; freehandSamples.clear();
                 freehandTail.clear(); freehandPressureSeed=-1; freehandRunningLength=0;
                 freehandMinimumLength=false; freehandLastRender=0;
+                liveContours=std::make_shared<std::vector<std::vector<Windows::Foundation::Point>>>(); frozenContourCount=0;
                 addFreehandSample(point);
                 liveFreehandPath=Windows::UI::Xaml::Shapes::Path();
                 liveFreehandPath.IsHitTestVisible(false); liveFreehandPath.Fill(SolidColorBrush(Palette[colorIndex].value));
@@ -232,6 +370,11 @@ class App {
             })),true);
         root.AddHandler(UIElement::PointerMovedEvent(),box_value(XamlInput::PointerEventHandler(
             [this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
+                if (erasing && args.Pointer().PointerId()==eraserPointer) {
+                    auto points=args.GetIntermediatePoints(freehandInputRoot);
+                    for (uint32_t i=points.Size();i>0;--i) eraseTo(points.GetAt(i-1).Position());
+                    args.Handled(true); return;
+                }
                 if (!drawingFreehand || args.Pointer().PointerId()!=freehandPointer) return;
                 auto points=args.GetIntermediatePoints(freehandInputRoot);
                 for (uint32_t i=points.Size();i>0;--i) addFreehandSample(points.GetAt(i-1));
@@ -239,16 +382,22 @@ class App {
             })),true);
         root.AddHandler(UIElement::PointerReleasedEvent(),box_value(XamlInput::PointerEventHandler(
             [this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
+                if (erasing && args.Pointer().PointerId()==eraserPointer) {
+                    eraseTo(args.GetCurrentPoint(freehandInputRoot).Position()); finishErase(); args.Handled(true); return;
+                }
                 if (!drawingFreehand || args.Pointer().PointerId()!=freehandPointer) return;
                 addFreehandSample(args.GetCurrentPoint(freehandInputRoot)); renderFreehand(true);
-                drawingOrder.push_back({0,liveFreehandStroke});
+                UndoItem item; item.freehandStroke=liveFreehandStroke; item.sequence=++nextSequence; item.contours=liveContours;
+                drawingOrder.push_back(item); recordEdit({true,{item}}); liveContours.reset();
                 drawingFreehand=false; liveFreehandPath=nullptr; liveFreehandStroke=nullptr; freehandSamples.clear(); freehandTail.clear();
                 freehandInputRoot.ReleasePointerCapture(args.Pointer()); args.Handled(true);
             })),true);
         root.PointerCanceled([this](auto const&, auto const& args) {
+            if (erasing && args.Pointer().PointerId()==eraserPointer) finishErase();
             if (drawingFreehand && args.Pointer().PointerId()==freehandPointer) cancelFreehand();
         });
         root.PointerCaptureLost([this](auto const&, auto const& args) {
+            if (erasing && args.Pointer().PointerId()==eraserPointer) finishErase();
             if (drawingFreehand && args.Pointer().PointerId()==freehandPointer) cancelFreehand();
         });
     }
@@ -268,11 +417,13 @@ class App {
         if (shapeSurface) shapeSurface.ReleasePointerCaptures();
     }
     void setTool(Tool next) {
+        finishErase(); eraserMode=false;
         cancelFreehand();
         cancelShape(); tool=requestedTool=next;
         shapeSurface.Visibility(tool==Tool::Pen ? Visibility::Collapsed : Visibility::Visible);
         presenter.IsInputEnabled(active && tool==Tool::Pen);
         updateHint();
+        if (active) finishCursorAnimation();
     }
     void syncHeldTool() {
         bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
@@ -306,7 +457,7 @@ class App {
         if (tool==Tool::Arrow) {
             float dx=b.X-a.X,dy=b.Y-a.Y,length=std::hypot(dx,dy);
             if (length>0) {
-                float head=std::min(length*0.45f,std::max(18.0f,shapeAttributes.Size().Width*3));
+                float head=std::min(length*0.45f,std::max(18.0f,shapeAttributes.Size().Width/ShapeWidthScale*3));
                 float ux=dx/length,uy=dy/length;
                 points.push_back({b.X-ux*head-uy*head*0.5f,b.Y-uy*head+ux*head*0.5f});
                 points.push_back(b);
@@ -328,7 +479,7 @@ class App {
             InkStrokeBuilder builder; builder.SetDefaultDrawingAttributes(shapeAttributes);
             auto stroke=builder.CreateStroke(points);
             presenter.StrokeContainer().AddStroke(stroke);
-            drawingOrder.push_back({stroke.Id(),nullptr});
+            rememberInk(stroke);
         }
         cancelShape();
         if (tool!=requestedTool) setTool(requestedTool);
@@ -347,6 +498,8 @@ class App {
             if (!shapeSurface.CapturePointer(args.Pointer())) return;
             drawingShape=true; shapePointer=args.Pointer().PointerId(); shapeStart=point.Position();
             shapeAttributes=presenter.CopyDefaultDrawingAttributes();
+            auto size=shapeAttributes.Size();
+            shapeAttributes.Size({size.Width*ShapeWidthScale,size.Height*ShapeWidthScale});
             shapeAttributes.IgnorePressure(true); shapeAttributes.FitToCurve(false);
             shapeAttributes.ModelerAttributes().UseVelocityBasedPressure(false);
             preview.Stroke(SolidColorBrush(shapeAttributes.Color())); preview.StrokeThickness(shapeAttributes.Size().Width);
@@ -380,6 +533,7 @@ class App {
     int wheelRemainder{};
     Canvas cursorSurface{nullptr};
     Windows::UI::Xaml::Shapes::Ellipse cursorDot{nullptr};
+    Windows::UI::Xaml::Shapes::Ellipse cursorRing{nullptr};
     ULONGLONG cursorStarted{};
     bool cursorAnimating{};
     unsigned cursorHideCalls{};
@@ -399,11 +553,24 @@ class App {
         if (!active || !cursorDot) return;
         POINT point{}; GetCursorPos(&point); ScreenToClient(island,&point);
         float scale=static_cast<float>(GetDpiForWindow(island))/96.0f;
-        Canvas::SetLeft(cursorDot,point.x/scale-static_cast<float>(cursorDot.Width())/2);
-        Canvas::SetTop(cursorDot,point.y/scale-static_cast<float>(cursorDot.Height())/2);
+        float x=eraserMode && cursorTouch ? eraserPosition.X : point.x/scale;
+        float y=eraserMode && cursorTouch ? eraserPosition.Y : point.y/scale;
+        Canvas::SetLeft(cursorDot,x-static_cast<float>(cursorDot.Width())/2);
+        Canvas::SetTop(cursorDot,y-static_cast<float>(cursorDot.Height())/2);
+        if (cursorRing) {
+            Canvas::SetLeft(cursorRing,x-EraserDiameter/2); Canvas::SetTop(cursorRing,y-EraserDiameter/2);
+        }
     }
     void refreshCursor(float diameter, float opacity=1.0f) {
         if (!cursorDot) return;
+        if (eraserMode) {
+            cursorDot.Fill(nullptr); cursorDot.Stroke(SolidColorBrush(Color{255,255,255,255})); cursorDot.StrokeThickness(1);
+            cursorDot.Width(EraserDiameter-2); cursorDot.Height(EraserDiameter-2); cursorDot.Opacity(1);
+            cursorRing.Visibility(Visibility::Visible);
+            cursorSurface.Visibility(active && (!cursorTouch || erasing) ? Visibility::Visible : Visibility::Collapsed);
+            positionCursor(); return;
+        }
+        if (cursorRing) cursorRing.Visibility(Visibility::Collapsed);
         auto color=Palette[colorIndex].value;
         BYTE contrast=(color.R*299+color.G*587+color.B*114)>150000 ? 25 : 245;
         cursorDot.Fill(SolidColorBrush(color));
@@ -429,6 +596,7 @@ class App {
         } else positionCursor();
     }
     HWND settingsWindow{};
+    HWND aboutWindow{};
     inline static HWND hotkeyEdit{};
     static LRESULT CALLBACK hotkeyMessageProcedure(int code, WPARAM w, LPARAM l) {
         if (code>=0 && w==PM_REMOVE && hotkeyEdit && GetFocus()==hotkeyEdit) {
@@ -481,19 +649,38 @@ class App {
         if (status!=ERROR_SUCCESS) { error=L"无法更新开机自动运行设置。"; return false; }
         return true;
     }
-    bool applySettings(UINT mods, UINT code, bool hint, bool startup, std::wstring& error) {
+    static bool setMouseEmphasis(bool enabled) {
+        return SystemParametersInfoW(SPI_SETMOUSESONAR,0,
+            reinterpret_cast<void*>(static_cast<INT_PTR>(enabled)),SPIF_UPDATEINIFILE|SPIF_SENDCHANGE)!=FALSE;
+    }
+    bool applySettings(UINT mods, UINT code, bool hint, bool startup, int emphasis, std::wstring& error) {
         if (!validShortcut(mods,code)) { error=L"请选择包含 Ctrl 或 Alt 的组合键；F12 为系统保留键。"; return false; }
+        BOOL oldEmphasis{};
+        bool emphasisChanged=false;
+        if (emphasis>=0) {
+            if (!SystemParametersInfoW(SPI_GETMOUSESONAR,0,&oldEmphasis,0)) {
+                error=L"无法读取 Windows 鼠标强调设置。"; return false;
+            }
+            emphasisChanged=(oldEmphasis!=FALSE)!=(emphasis!=0);
+            if (emphasisChanged && !setMouseEmphasis(emphasis!=0)) {
+                error=L"无法更新 Windows 鼠标强调设置。"; return false;
+            }
+        }
+        auto restoreEmphasis=[&] {
+            if (emphasisChanged && !setMouseEmphasis(oldEmphasis!=FALSE))
+                error+=L"\n鼠标强调设置恢复失败，请在 Windows 鼠标设置中检查。";
+        };
         auto parent=settingsPath.substr(0,settingsPath.find_last_of(L"\\"));
         CreateDirectoryW(parent.c_str(),nullptr);
         auto oldStartup=startupEnabled();
-        if (!setStartup(startup,error)) return false;
+        if (!setStartup(startup,error)) { restoreEmphasis(); return false; }
         if (settingsPath.empty() || !WritePrivateProfileStringW(L"UI",L"ShowHint",hint ? L"1" : L"0",settingsPath.c_str())) {
             std::wstring rollback; setStartup(oldStartup,rollback);
-            error=L"无法保存悬浮状态菜单设置。"; return false;
+            error=L"无法保存悬浮状态菜单设置。"; restoreEmphasis(); return false;
         }
         if (!applyShortcut(mods,code,error)) {
             WritePrivateProfileStringW(L"UI",L"ShowHint",showHint ? L"1" : L"0",settingsPath.c_str());
-            std::wstring rollback; setStartup(oldStartup,rollback); return false;
+            std::wstring rollback; setStartup(oldStartup,rollback); restoreEmphasis(); return false;
         }
         showHint=hint; runAtStartup=startup; updateHint(); saveBrushSettings(); return true;
     }
@@ -555,6 +742,34 @@ class App {
         return true;
     }
     static LRESULT CALLBACK hotkeyProcedure(HWND control, UINT msg, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
+        if (msg==WM_PAINT) {
+            PAINTSTRUCT paint{}; auto dc=BeginPaint(control,&paint);
+            RECT area{}; GetClientRect(control,&area);
+            FillRect(dc,&area,GetSysColorBrush(COLOR_WINDOW));
+            auto font=SelectObject(dc,reinterpret_cast<HFONT>(SendMessageW(control,WM_GETFONT,0,0)));
+            SetBkMode(dc,TRANSPARENT); SetTextColor(dc,GetSysColor(COLOR_WINDOWTEXT));
+            auto value=SendMessageW(control,HKM_GETHOTKEY,0,0);
+            auto flags=HIBYTE(value); auto key=LOBYTE(value);
+            std::wstring text;
+            auto append=[&text](const wchar_t* part) { if (!text.empty()) text+=L" + "; text+=part; };
+            if (flags & HOTKEYF_CONTROL) append(L"Ctrl");
+            if (flags & HOTKEYF_ALT) append(L"Alt");
+            if (flags & HOTKEYF_SHIFT) append(L"Shift");
+            if (key) {
+                wchar_t name[64]{};
+                LONG scan=static_cast<LONG>(MapVirtualKeyW(key,MAPVK_VK_TO_VSC)<<16);
+                if (flags & HOTKEYF_EXT) scan|=1<<24;
+                GetKeyNameTextW(scan,name,64); append(name);
+            }
+            DrawTextW(dc,text.c_str(),static_cast<int>(text.size()),&area,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+            SelectObject(dc,font); EndPaint(control,&paint); return 0;
+        }
+        if (msg==WM_SETFOCUS) {
+            auto result=DefSubclassProc(control,msg,w,l); HideCaret(control); InvalidateRect(control,nullptr,TRUE); return result;
+        }
+        if (msg==HKM_SETHOTKEY) {
+            auto result=DefSubclassProc(control,msg,w,l); InvalidateRect(control,nullptr,TRUE); return result;
+        }
         if (msg==WM_NCDESTROY) { RemoveWindowSubclass(control,hotkeyProcedure,1); return DefSubclassProc(control,msg,w,l); }
         if (msg==WM_GETDLGCODE) {
             auto input=reinterpret_cast<MSG*>(l);
@@ -590,7 +805,7 @@ class App {
         SelectObject(dc,old); ReleaseDC(label,dc);
         int delta=measured.bottom-area.bottom;
         SetWindowPos(label,nullptr,0,0,area.right,measured.bottom,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
-        for (int id:{IDC_INSTRUCTION_GROUP,IDC_SHOW_HINT,IDC_STARTUP,IDOK,IDCANCEL}) {
+        for (int id:{IDC_INSTRUCTION_GROUP,IDC_SHOW_HINT,IDC_STARTUP,IDC_MOUSE_EMPHASIS,IDOK,IDCANCEL}) {
             auto control=GetDlgItem(dialog,id); RECT r{}; GetWindowRect(control,&r);
             MapWindowPoints(nullptr,dialog,reinterpret_cast<POINT*>(&r),2);
             if (id==IDC_INSTRUCTION_GROUP)
@@ -608,24 +823,36 @@ class App {
             app=reinterpret_cast<App*>(l); SetWindowLongPtrW(dialog,DWLP_USER,l); app->settingsWindow=dialog;
             hotkeyEdit=GetDlgItem(dialog,IDC_HOTKEY);
             SetDlgItemTextW(dialog,IDC_INSTRUCTIONS,
-                L"- 按下设定的快捷键进入标注状态，再次按下或按Esc退出；\r\n\r\n"
-                L"- 用鼠标左键、触控笔或触摸屏幕绘制\r\n"
-                L"- 触控笔模式支持压感\r\n\r\n"
-                L"- 标注状态下按键1~5切换标注图形模式：\r\n"
-                L"  1 手写· 2 矩形· 3 椭圆·4 直线· 5 箭头\r\n\r\n"
-                L"- 亦可用快捷键快速绘制图形：\r\n"
-                L"  Ctrl 矩形；Tab 椭圆；Shift 直线；Ctrl+Shift 箭头\r\n\r\n"
-                L"- 按键字母键切换笔迹颜色：\r\n"
-                L"  R 红色；G 绿色；O 橙色；P 粉紫色\r\n"
-                L"  B 蓝色；W 白色；Y 黄色\r\n\r\n"
-                L"- Ctrl +滚轮：调整笔迹粗细（6–24，默认12)\r\n\r\n"
-                L"- Ctrl + Z：撤销上一笔或图形\r\n"
-                L"- C：清空全部笔迹\r\n"
-                L"- 退出标注状态时会清空笔迹，如需要请按PrtScr键截屏保存");
+                L"- 按下快捷键进行标注，再次按下或Esc退出\r\n"
+                L"- 用鼠标、触控笔或触摸屏幕绘制，均支持压感效果\r\n"
+                L"\r\n"
+                L"- 按键1~5切换标注的图形模式：\r\n"
+                L"  1手写，2矩形，3椭圆，4直线，5箭头\r\n"
+                L"- 亦可配合修饰键快速绘制图形：\r\n"
+                L"  Ctrl矩形，Tab椭圆，Shift直线，Ctrl+Shift箭头\r\n"
+                L"- 按键切换笔迹颜色，共七种：\r\n"
+                L"  R红色，G绿色，B蓝色，O橙色，Y黄色，P紫色，W白色\r\n"
+                L"\r\n"
+                L"- Ctrl+滚轮：调整笔迹粗细(6~24px，默认12px)\r\n"
+                L"- Ctrl+Z：撤销上一笔画或图形\r\n"
+                L"- Ctrl+Y：恢复撤销的操作\r\n"
+                L"\r\n"
+                L"- K：切换为纯黑背景，可模拟在黑板上书写\r\n"
+                L"- E：橡皮擦\r\n"
+                L"- C：清空笔迹\r\n"
+                L"\r\n"
+                L"- 退出标注状态会清空笔迹，如需要请按PrtScr键截屏保存");
             fitSettings(dialog);
             app->runAtStartup=app->startupEnabled();
             CheckDlgButton(dialog,IDC_SHOW_HINT,app->showHint ? BST_CHECKED : BST_UNCHECKED);
             CheckDlgButton(dialog,IDC_STARTUP,app->runAtStartup ? BST_CHECKED : BST_UNCHECKED);
+            BOOL emphasis{};
+            if (SystemParametersInfoW(SPI_GETMOUSESONAR,0,&emphasis,0))
+                CheckDlgButton(dialog,IDC_MOUSE_EMPHASIS,emphasis ? BST_CHECKED : BST_UNCHECKED);
+            else {
+                EnableWindow(GetDlgItem(dialog,IDC_MOUSE_EMPHASIS),FALSE);
+                SetDlgItemTextW(dialog,IDC_MOUSE_EMPHASIS,L"鼠标强调（无法读取 Windows 系统设置）");
+            }
             BYTE flags=0;
             if (app->hotkeyModifiers & MOD_CONTROL) flags|=HOTKEYF_CONTROL;
             if (app->hotkeyModifiers & MOD_ALT) flags|=HOTKEYF_ALT;
@@ -660,7 +887,9 @@ class App {
                 if (flags & HOTKEYF_SHIFT) mods|=MOD_SHIFT;
                 std::wstring error;
                 if (!app->applySettings(mods,LOBYTE(value),IsDlgButtonChecked(dialog,IDC_SHOW_HINT)==BST_CHECKED,
-                    IsDlgButtonChecked(dialog,IDC_STARTUP)==BST_CHECKED,error)) {
+                    IsDlgButtonChecked(dialog,IDC_STARTUP)==BST_CHECKED,
+                    IsWindowEnabled(GetDlgItem(dialog,IDC_MOUSE_EMPHASIS)) ?
+                        (IsDlgButtonChecked(dialog,IDC_MOUSE_EMPHASIS)==BST_CHECKED ? 1 : 0) : -1,error)) {
                     MessageBoxW(dialog,error.c_str(),L"MyZoomIt 设置",MB_OK|MB_ICONWARNING); return TRUE;
                 }
                 EndDialog(dialog,IDOK); return TRUE;
@@ -692,8 +921,8 @@ class App {
     }
 
     void updateHint() {
-        hintText.Text(std::wstring(L"标注中  ·  ")+toolName()+L"  ·  "+Palette[colorIndex].name+L"  ·  Ctrl+滚轮 粗细 "+
-            std::to_wstring(static_cast<int>(penWidth))+L"  ·  Ctrl+Z 撤销  ·  C 清空  ·  Esc 返回\n按住 Ctrl 矩形 / Tab 椭圆 / Shift 直线 / Ctrl+Shift 箭头");
+        hintText.Text(std::wstring(L"标注中  ·  ")+(eraserMode ? L"橡皮擦" : toolName())+L"  ·  "+Palette[colorIndex].name+L"  ·  Ctrl+滚轮 粗细 "+
+            std::to_wstring(static_cast<int>(penWidth))+L"  ·  Ctrl+Z 撤销  ·  Ctrl+Y 恢复  ·  E：橡皮擦  ·  C 清空  ·  K 黑板  ·  Esc 返回\n按住 Ctrl 矩形 / Tab 椭圆 / Shift 直线 / Ctrl+Shift 箭头");
         if (hintPanel) hintPanel.Visibility(showHint ? Visibility::Visible : Visibility::Collapsed);
     }
     bool setColor(WORD keyCode) {
@@ -732,8 +961,11 @@ class App {
         wcsncpy_s(icon.szTip,tip.c_str(),_TRUNCATE);
         Shell_NotifyIconW(NIM_ADD, &icon);
     }
-    void clear() {
-        cancelFreehand(); drawingOrder.clear();
+    void clear(bool resetHistory=true) {
+        cancelFreehand(); finishErase();
+        if (!resetHistory && !drawingOrder.empty()) recordEdit({false,drawingOrder});
+        drawingOrder.clear();
+        if (resetHistory) { undoHistory.clear(); redoHistory.clear(); }
         if (freehandSurface) freehandSurface.Children().Clear();
         cancelShape();
         if (shapeSurface && tool!=requestedTool) setTool(requestedTool);
@@ -742,19 +974,17 @@ class App {
     void undo() {
         if (drawingFreehand) { cancelFreehand(); return; }
         if (drawingShape) { cancelShape(); if (tool!=requestedTool) setTool(requestedTool); return; }
-        auto container=presenter.StrokeContainer();
-        auto strokes=container.GetStrokes();
-        if (!drawingOrder.empty()) {
-            auto item=drawingOrder.back();
-            if (item.freehandStroke) {
-                uint32_t index{};
-                if (freehandSurface.Children().IndexOf(item.freehandStroke,index)) freehandSurface.Children().RemoveAt(index);
-            } else {
-                for (auto const& stroke:strokes) stroke.Selected(stroke.Id()==item.inkId);
-                container.DeleteSelected();
-            }
-            drawingOrder.pop_back(); return;
-        }
+        finishErase();
+        if (undoHistory.empty()) return;
+        auto edit=undoHistory.back(); applyEdit(edit,!edit.added);
+        undoHistory.pop_back(); redoHistory.push_back(std::move(edit));
+    }
+    void redo() {
+        if (drawingFreehand || drawingShape) return;
+        finishErase();
+        if (redoHistory.empty()) return;
+        auto edit=redoHistory.back(); applyEdit(edit,edit.added);
+        redoHistory.pop_back(); undoHistory.push_back(std::move(edit));
     }
     void leave(bool restore = true) {
         if (!active || changing) return;
@@ -765,7 +995,8 @@ class App {
         presenter.IsInputEnabled(false);
         ShowWindow(window, SW_HIDE);
         active = false;
-        clear();
+        blackboard.Visibility(Visibility::Collapsed);
+        clear(); eraserMode=false; cursorTouch=false;
         if (heldTool) { heldTool=false; setTool(Tool::Pen); }
         saveBrushSettings();
         if (restore && IsWindow(previous)) SetForegroundWindow(previous);
@@ -773,6 +1004,7 @@ class App {
     }
     void enter() {
         if (settingsWindow) { SetForegroundWindow(settingsWindow); return; }
+        if (aboutWindow) { SetForegroundWindow(aboutWindow); return; }
         if (changing) return;
         if (active) { leave(); return; }
         changing = true;
@@ -785,10 +1017,11 @@ class App {
         if (!GetMonitorInfoW(monitor, &info)) { changing = false; return; }
         auto r = info.rcMonitor;
         try {
+            blackboard.Visibility(Visibility::Collapsed);
             SetWindowPos(window, HWND_TOPMOST, r.left, r.top, r.right-r.left, r.bottom-r.top, 0);
             presenter.IsInputEnabled(tool==Tool::Pen);
             active = true;
-            syncHeldTool();
+            updateHint(); syncHeldTool();
             ShowWindow(window, SW_SHOW);
             SetForegroundWindow(window);
             SetFocus(island);
@@ -802,12 +1035,51 @@ class App {
             throw;
         }
     }
+    static INT_PTR CALLBACK aboutProcedure(HWND dialog, UINT msg, WPARAM w, LPARAM l) {
+        auto app=reinterpret_cast<App*>(GetWindowLongPtrW(dialog,DWLP_USER));
+        if (msg==WM_INITDIALOG) {
+            app=reinterpret_cast<App*>(l); SetWindowLongPtrW(dialog,DWLP_USER,l); app->aboutWindow=dialog;
+            SendMessageW(dialog,WM_SETICON,ICON_BIG,reinterpret_cast<LPARAM>(appIcon(false)));
+            SendMessageW(dialog,WM_SETICON,ICON_SMALL,reinterpret_cast<LPARAM>(appIcon(true)));
+            SetDlgItemTextW(dialog,IDC_ABOUT_TEXT,
+                L"myZoomit - " MYZOOMIT_VERSION_W L"\r\n轻量屏幕标注工具");
+            PostMessageW(dialog,SettingsReadyMessage,0,0); return TRUE;
+        }
+        if (!app) return FALSE;
+        if (msg==SettingsReadyMessage) {
+            ShowWindow(dialog,SW_SHOWNORMAL); SetForegroundWindow(dialog); SetFocus(GetDlgItem(dialog,IDOK)); return TRUE;
+        }
+        if (msg==WM_NOTIFY) {
+            auto notification=reinterpret_cast<NMHDR*>(l);
+            if (notification->code==NM_CLICK || notification->code==NM_RETURN) {
+                const wchar_t* target=notification->idFrom==IDC_PROJECT_LINK ? L"https://github.com/Algustav/myZoomit" :
+                    notification->idFrom==IDC_CREDITS_LINK ? L"https://github.com/steveruizok/perfect-freehand" :
+                    notification->idFrom==IDC_CONTACT_LINK ? L"mailto:mail@ganlei.com" : nullptr;
+                if (target && reinterpret_cast<INT_PTR>(ShellExecuteW(dialog,L"open",target,nullptr,nullptr,SW_SHOWNORMAL))<=32)
+                    MessageBoxW(dialog,L"无法打开链接，请检查默认浏览器或邮件应用。",L"myZoomit",MB_OK|MB_ICONWARNING);
+                return TRUE;
+            }
+        }
+        if (msg==WM_COMMAND && (LOWORD(w)==IDOK || LOWORD(w)==IDCANCEL)) { EndDialog(dialog,LOWORD(w)); return TRUE; }
+        if (msg==WM_CLOSE) { EndDialog(dialog,IDCANCEL); return TRUE; }
+        if (msg==WM_DESTROY) app->aboutWindow=nullptr;
+        return FALSE;
+    }
+    void about() {
+        if (aboutWindow) { SetForegroundWindow(aboutWindow); return; }
+        leave();
+        if (DialogBoxParamW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(IDD_ABOUT),nullptr,aboutProcedure,reinterpret_cast<LPARAM>(this))==-1) {
+            auto error=L"无法打开关于窗口。错误代码："+std::to_wstring(GetLastError());
+            MessageBoxW(nullptr,error.c_str(),L"myZoomit",MB_OK|MB_ICONWARNING);
+        }
+        aboutWindow=nullptr;
+    }
     void menu() {
         auto popup = CreatePopupMenu();
         auto label=L"开始 / 结束标注\t"+shortcutText();
         AppendMenuW(popup, MF_STRING, 1, label.c_str());
-        AppendMenuW(popup, MF_STRING, 2, L"清空笔迹");
         AppendMenuW(popup, MF_STRING, 4, L"设置…");
+        AppendMenuW(popup, MF_STRING, 5, L"关于…");
         AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(popup, MF_STRING, 3, L"退出");
         POINT point{}; GetCursorPos(&point);
@@ -817,9 +1089,9 @@ class App {
         DestroyMenu(popup);
         PostMessageW(window, WM_NULL, 0, 0);
         if (command == 1) enter();
-        else if (command == 2) clear();
         else if (command == 3) PostMessageW(window, WM_CLOSE, 0, 0);
         else if (command == 4) PostMessageW(window,SettingsMessage,0,0);
+        else if (command == 5) PostMessageW(window,AboutMessage,0,0);
     }
     static LRESULT CALLBACK procedure(HWND hwnd, UINT message, WPARAM w, LPARAM l) noexcept {
         auto app = reinterpret_cast<App*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -842,7 +1114,8 @@ class App {
         switch (msg) {
         case ActivateMessage: if (!active) enter(); return 0;
         case SettingsMessage: settings(); return 0;
-        case WM_HOTKEY: if (hotkey && !settingsWindow && static_cast<int>(w)==hotkeyId) enter(); return 0;
+        case AboutMessage: about(); return 0;
+        case WM_HOTKEY: if (hotkey && !settingsWindow && !aboutWindow && static_cast<int>(w)==hotkeyId) enter(); return 0;
         case WM_SIZE:
             if (island) SetWindowPos(island, nullptr, 0, 0, LOWORD(l), HIWORD(l), SWP_NOZORDER | SWP_NOACTIVATE);
             return 0;
@@ -851,12 +1124,11 @@ class App {
         case WM_DISPLAYCHANGE: case WM_DPICHANGED: leave(false); monitor = nullptr; clear(); return 0;
         case WM_WTSSESSION_CHANGE: if (w == WTS_SESSION_LOCK) leave(false); return 0;
         case TrayMessage:
-            if (l == WM_LBUTTONDBLCLK) enter();
-            else if (l == WM_RBUTTONUP) menu();
+            if (l == WM_LBUTTONUP || l == WM_RBUTTONUP) menu();
             return 0;
         case WM_SETCURSOR: if (active) { SetCursor(nullptr); return TRUE; } break;
         case WM_TIMER: if (w==CursorTimer) animateCursor(); return 0;
-        case WM_CLOSE: saveBrushSettings(); if (settingsWindow) EndDialog(settingsWindow,IDCANCEL); leave(); DestroyWindow(window); return 0;
+        case WM_CLOSE: saveBrushSettings(); if (settingsWindow) EndDialog(settingsWindow,IDCANCEL); if (aboutWindow) EndDialog(aboutWindow,IDCANCEL); leave(); DestroyWindow(window); return 0;
         case WM_DESTROY:
             KillTimer(window,CursorTimer);
             restoreSystemCursor();
@@ -869,7 +1141,8 @@ class App {
     }
 public:
     int run(HINSTANCE instance) {
-        INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_HOTKEY_CLASS}; InitCommonControlsEx(&controls);
+        INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_HOTKEY_CLASS|ICC_LINK_CLASS};
+        if (!InitCommonControlsEx(&controls)) throw hresult_error(HRESULT_FROM_WIN32(GetLastError()));
         loadSettings();
         WNDCLASSW wc{}; wc.lpfnWndProc=procedure; wc.hInstance=instance;
         wc.hIcon=appIcon(false);
@@ -878,6 +1151,9 @@ public:
         window=CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP,
             ClassName, L"MyZoomIt", WS_POPUP, 0,0,800,600,nullptr,nullptr,instance,this);
         if (!window) throw hresult_error(HRESULT_FROM_WIN32(GetLastError()));
+        // This screen-sized annotation overlay must not trigger fullscreen taskbar behavior.
+        if (!SetPropW(window,L"NonRudeHWND",reinterpret_cast<HANDLE>(static_cast<INT_PTR>(1))))
+            throw hresult_error(HRESULT_FROM_WIN32(GetLastError()));
         MARGINS margins{-1,-1,-1,-1}; check_hresult(DwmExtendFrameIntoClientArea(window, &margins));
         DWORD preference=1; DwmSetWindowAttribute(window, DWMWA_WINDOW_CORNER_PREFERENCE, &preference, sizeof(preference));
         manager=WindowsXamlManager::InitializeForCurrentThread();
@@ -888,6 +1164,11 @@ public:
         check_hresult(native->get_WindowHandle(&island));
         Grid root;
         root.Background(SolidColorBrush(Color{0,0,0,0}));
+        blackboard=Border();
+        blackboard.Background(SolidColorBrush(Color{255,0,0,0}));
+        blackboard.IsHitTestVisible(false);
+        blackboard.Visibility(Visibility::Collapsed);
+        root.Children().Append(blackboard);
         canvas=InkCanvas(); presenter=canvas.InkPresenter();
         presenter.InputDeviceTypes(Windows::UI::Core::CoreInputDeviceTypes::Pen);
         InkDrawingAttributes attributes;
@@ -897,7 +1178,17 @@ public:
         presenter.UpdateDefaultDrawingAttributes(attributes); presenter.IsInputEnabled(false);
         presenter.StrokesCollected([this](auto const&, InkStrokesCollectedEventArgs const& args) {
             if (!active) { clear(); return; }
-            for (auto const& stroke:args.Strokes()) drawingOrder.push_back({stroke.Id(),nullptr});
+            finishErase();
+            for (auto const& stroke:args.Strokes()) rememberInk(stroke);
+        });
+        presenter.StrokesErased([this](auto const&, InkStrokesErasedEventArgs const& args) {
+            finishErase();
+            std::vector<UndoItem> removed;
+            for (auto const& stroke:args.Strokes()) {
+                auto found=std::find_if(drawingOrder.begin(),drawingOrder.end(),[&](auto const& item) { return !item.freehandStroke && item.inkId==stroke.Id(); });
+                if (found!=drawingOrder.end()) { removed.push_back(*found); drawingOrder.erase(found); }
+            }
+            recordEdit({false,std::move(removed)});
         });
         root.Children().Append(canvas);
         initializeFreehand(root);
@@ -924,10 +1215,21 @@ public:
         hint.Child(hintText); root.Children().Append(hint); updateWidth(penWidth);
         cursorSurface=Canvas(); cursorSurface.IsHitTestVisible(false);
         cursorSurface.Visibility(Visibility::Collapsed);
+        cursorRing=Windows::UI::Xaml::Shapes::Ellipse(); cursorRing.Fill(nullptr);
+        cursorRing.Stroke(SolidColorBrush(Color{255,0,0,0})); cursorRing.StrokeThickness(1);
+        cursorRing.Width(EraserDiameter); cursorRing.Height(EraserDiameter); cursorRing.Visibility(Visibility::Collapsed);
+        cursorSurface.Children().Append(cursorRing);
         cursorDot=Windows::UI::Xaml::Shapes::Ellipse();
         cursorSurface.Children().Append(cursorDot); root.Children().Append(cursorSurface);
         root.AddHandler(UIElement::PointerMovedEvent(),box_value(XamlInput::PointerEventHandler(
-            [this](auto const&, auto const&) { positionCursor(); })),true);
+            [this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
+                auto point=args.GetCurrentPoint(freehandInputRoot);
+                if (eraserMode && (!erasing || args.Pointer().PointerId()==eraserPointer)) {
+                    cursorTouch=point.PointerDevice().PointerDeviceType()==Windows::Devices::Input::PointerDeviceType::Touch;
+                    if (cursorTouch) eraserPosition=point.Position();
+                    refreshCursor(penWidth);
+                } else positionCursor();
+            })),true);
         source.Content(root);
         // Ink uses an independent input thread and cursor, separate from CoreWindow's cursor.
         inkInput=Windows::UI::Input::Inking::Core::CoreInkIndependentInputSource::Create(presenter);
@@ -955,13 +1257,26 @@ public:
                 wheel(GET_WHEEL_DELTA_WPARAM(msg.wParam)); continue;
             }
             if (active && msg.message == WM_KEYDOWN && (msg.hwnd == window || IsChild(window,msg.hwnd))) {
+                if (msg.wParam=='K' && !(GetKeyState(VK_CONTROL)&0x8000) &&
+                    !(GetKeyState(VK_MENU)&0x8000) && !(GetKeyState(VK_SHIFT)&0x8000) &&
+                    !(GetKeyState(VK_LWIN)&0x8000) && !(GetKeyState(VK_RWIN)&0x8000)) {
+                    // A held key toggles once, rather than on every repeat message.
+                    if (!(msg.lParam & (static_cast<LPARAM>(1)<<30)))
+                        blackboard.Visibility(blackboard.Visibility()==Visibility::Visible ? Visibility::Collapsed : Visibility::Visible);
+                    continue;
+                }
                 if (msg.wParam == VK_ESCAPE) { leave(); continue; }
-                if (msg.wParam == 'Z' && (GetKeyState(VK_CONTROL)&0x8000)) { undo(); continue; }
+                if (msg.wParam == 'Z' && (GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_MENU)&0x8000)) { undo(); continue; }
+                if (msg.wParam == 'Y' && (GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_MENU)&0x8000)) { redo(); continue; }
+                if (msg.wParam=='E' && !(GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_MENU)&0x8000) && !(GetKeyState(VK_SHIFT)&0x8000)) {
+                    if (!(msg.lParam & (static_cast<LPARAM>(1)<<30))) toggleEraser();
+                    continue;
+                }
                 if (!(GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_MENU)&0x8000) && msg.wParam>='1' && msg.wParam<='5') {
                     setTool(static_cast<Tool>(msg.wParam-'1')); continue;
                 }
                 if (!(GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_MENU)&0x8000) && setColor(static_cast<WORD>(msg.wParam))) continue;
-                if (msg.wParam == 'C') { clear(); continue; }
+                if (msg.wParam == 'C') { clear(false); continue; }
             }
             if (active && msg.message==WM_SETCURSOR && (msg.hwnd==window || IsChild(window,msg.hwnd))) {
                 SetCursor(nullptr); continue;
@@ -971,8 +1286,8 @@ public:
             if (!handled) { TranslateMessage(&msg); DispatchMessageW(&msg); }
             if (active) hideSystemCursor();
         }
-        cancelFreehand(); freehandSurface=nullptr; freehandInputRoot=nullptr; drawingOrder.clear();
-        cursorDot=nullptr; cursorSurface=nullptr; inkInput=nullptr; presenter=nullptr; canvas=nullptr; hintText=nullptr; hintPanel=nullptr; preview=nullptr; shapeSurface=nullptr; source.Content(nullptr); native=nullptr;
+        cancelFreehand(); freehandSurface=nullptr; freehandInputRoot=nullptr; drawingOrder.clear(); undoHistory.clear(); redoHistory.clear(); liveContours.reset();
+        cursorDot=nullptr; cursorRing=nullptr; cursorSurface=nullptr; inkInput=nullptr; presenter=nullptr; canvas=nullptr; blackboard=nullptr; hintText=nullptr; hintPanel=nullptr; preview=nullptr; shapeSurface=nullptr; source.Content(nullptr); native=nullptr;
         source.Close(); source=nullptr; manager.Close(); manager=nullptr;
         return status==-1 ? 1 : static_cast<int>(msg.wParam);
     }

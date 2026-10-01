@@ -1,1 +1,0 @@
-Release build completed. Drawing behavior confirmed manually by the user before cleanup; no automated or desktop drawing tests rerun after cleanup.

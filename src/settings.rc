@@ -4,8 +4,8 @@
 #include "version.h"
 IDI_APP ICON "assets/myzoomit.ico"
 1 VERSIONINFO
-FILEVERSION 1,5,0,0
-PRODUCTVERSION 1,5,0,0
+FILEVERSION 1,6,0,0
+PRODUCTVERSION 1,6,0,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -24,20 +24,35 @@ BEGIN
         VALUE "Translation", 0x0409, 1200
     END
 END
-IDD_SETTINGS DIALOGEX 0, 0, 364, 340
+IDD_SETTINGS DIALOGEX 0, 0, 280, 364
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "MyZoomIt v1.5 设置"
+CAPTION "MyZoomIt v1.6 设置"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT "标注快捷键", -1, 10, 14, 70, 12
-    CONTROL "", IDC_HOTKEY, "msctls_hotkey32", WS_TABSTOP | WS_BORDER, 86, 10, 134, 18
-    PUSHBUTTON "删除", IDC_DELETE_HOTKEY, 228, 10, 48, 18
-    PUSHBUTTON "恢复默认", IDC_RESET, 284, 10, 70, 18
-    LTEXT "按 Ctrl / Alt 组合键设置；删除后保存可停用快捷键。", -1, 10, 34, 344, 12
-    GROUPBOX "操作说明", IDC_INSTRUCTION_GROUP, 10, 54, 344, 234
-    LTEXT "", IDC_INSTRUCTIONS, 20, 68, 324, 210
-    AUTOCHECKBOX "显示悬浮状态菜单", IDC_SHOW_HINT, 10, 296, 160, 14
-    AUTOCHECKBOX "开机自动运行", IDC_STARTUP, 194, 296, 160, 14
-    DEFPUSHBUTTON "保存", IDOK, 232, 318, 56, 20
-    PUSHBUTTON "取消", IDCANCEL, 298, 318, 56, 20
+    LTEXT "快捷键", -1, 10, 14, 38, 12
+    CONTROL "", IDC_HOTKEY, "msctls_hotkey32", WS_TABSTOP | WS_BORDER, 52, 10, 92, 18
+    PUSHBUTTON "删除", IDC_DELETE_HOTKEY, 152, 10, 44, 18
+    PUSHBUTTON "默认", IDC_RESET, 204, 10, 44, 18
+    LTEXT "按 Ctrl / Alt 组合键设置；删除后保存可停用快捷键。", -1, 10, 34, 260, 12
+    GROUPBOX "操作说明", IDC_INSTRUCTION_GROUP, 10, 54, 260, 234
+    LTEXT "", IDC_INSTRUCTIONS, 20, 68, 240, 210
+    AUTOCHECKBOX "显示悬浮状态菜单", IDC_SHOW_HINT, 10, 294, 142, 14
+    AUTOCHECKBOX "开机自动运行", IDC_STARTUP, 160, 294, 110, 14
+    AUTOCHECKBOX "鼠标强调（按 Ctrl 显示鼠标位置，系统全局设置）", IDC_MOUSE_EMPHASIS, 10, 311, 260, 14
+    DEFPUSHBUTTON "保存", IDOK, 148, 334, 56, 20
+    PUSHBUTTON "取消", IDCANCEL, 214, 334, 56, 20
+END
+IDD_ABOUT DIALOGEX 0, 0, 264, 156
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "关于 myZoomit"
+FONT 9, "Segoe UI"
+BEGIN
+    GROUPBOX "关于", -1, 10, 8, 244, 114
+    LTEXT "", IDC_ABOUT_TEXT, 20, 20, 224, 24, SS_NOPREFIX
+    CONTROL "项目：<a href=""https://github.com/Algustav/myZoomit"">https://github.com/Algustav/myZoomit</a>", IDC_PROJECT_LINK, "SysLink", WS_TABSTOP, 20, 52, 224, 12
+    CONTROL "联系：<a href=""mailto:mail@ganlei.com"">mail@ganlei.com</a>", IDC_CONTACT_LINK, "SysLink", WS_TABSTOP, 20, 64, 224, 12
+    LTEXT "语言：C++     协议：MIT", -1, 20, 76, 224, 12
+    CONTROL "致谢：<a href=""https://github.com/steveruizok/perfect-freehand"">https://github.com/steveruizok/perfect-freehand</a>", IDC_CREDITS_LINK, "SysLink", WS_TABSTOP, 20, 92, 224, 12
+    LTEXT "by algustav & codex 2026", -1, 20, 108, 224, 12, SS_NOPREFIX
+    DEFPUSHBUTTON "关闭", IDOK, 198, 130, 56, 18
 END

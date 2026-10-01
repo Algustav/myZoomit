@@ -1,8 +1,0 @@
-22dd2321988c78eae05c9683c90f631693dda76ab8aa359147155584ecdb6a9b  MyZoomIt-v1.5-win-x64/LICENSE.txt
-b74deddbd894afab6129b9d7b020cc3de50b857214b4ca1ac808f673bd0992d9  MyZoomIt-v1.5-win-x64/MyZoomIt.exe
-8f04860fe5c5f77f71013eb8e60963f328a41edfb4712ee61639d2fb048c135d  MyZoomIt-v1.5-win-x64/perfect-freehand-LICENSE.txt
-29642790fce18c135cbebc0d41e0a18a4c5775b3520c1c7214683683bef39657  MyZoomIt-v1.5-win-x64/settings.ini
-88c807d5cb6bc25d321bf09c4ac5b7689d6cbc90f5d5da213d13accee1edf501  MyZoomIt-v1.5-win-x64/VERSION.txt
-04a0d30bcf5587405f4676b600b57f88a44b9d6ec714f7aa3d941a13a0a285c4  MyZoomIt-v1.5-win-x64/使用说明.txt
-e6675325ba9d78a6d10ced96e914b1b7edcb6bb2fa7e89a69ab1c7727d3d6061  MyZoomIt-v1.5-source.zip
-32817bb176bb3fc9270944febb058dc2808f6ed11cd722efc7d1b3b0e49c82d8  MyZoomIt-v1.5-win-x64.zip
