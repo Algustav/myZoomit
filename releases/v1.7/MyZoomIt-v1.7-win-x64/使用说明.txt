@@ -1,4 +1,4 @@
-﻿MyZoomIt v1.6 便携版
+﻿MyZoomIt v1.7 便携版
 
 适用 Windows 11 x64。无需安装，解压到可写文件夹，双击 MyZoomIt.exe。
 程序常驻托盘；可能位于托盘隐藏图标区。

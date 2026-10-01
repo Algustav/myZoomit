@@ -986,6 +986,35 @@ class App {
         auto edit=redoHistory.back(); applyEdit(edit,edit.added);
         redoHistory.pop_back(); undoHistory.push_back(std::move(edit));
     }
+    static bool fullscreenOnMonitor(HWND foreground, HMONITOR target, const RECT& screen) {
+        if (!IsWindow(foreground) || !IsWindowVisible(foreground) || IsIconic(foreground)) return false;
+        auto root=GetAncestor(foreground,GA_ROOT);
+        if (!root || MonitorFromWindow(root,MONITOR_DEFAULTTONEAREST)!=target) return false;
+        wchar_t name[128]{}; GetClassNameW(root,name,128);
+        // The desktop also fills a monitor, but must preserve normal taskbar behavior.
+        if (wcscmp(name,L"Progman")==0 || wcscmp(name,L"WorkerW")==0 ||
+            wcscmp(name,L"Shell_TrayWnd")==0 || wcscmp(name,L"Shell_SecondaryTrayWnd")==0) return false;
+        auto covers=[&](const RECT& bounds) {
+            constexpr int tolerance=2;
+            return bounds.left<=screen.left+tolerance && bounds.top<=screen.top+tolerance &&
+                bounds.right>=screen.right-tolerance && bounds.bottom>=screen.bottom-tolerance;
+        };
+        RECT bounds{};
+        if (FAILED(DwmGetWindowAttribute(root,DWMWA_EXTENDED_FRAME_BOUNDS,&bounds,sizeof(bounds))) &&
+            !GetWindowRect(root,&bounds)) return false;
+        if (!covers(bounds)) return false;
+        // Client coverage distinguishes F11 / slide shows from maximized windows,
+        // including maximized windows when the taskbar is set to auto-hide.
+        RECT client{};
+        if (!GetClientRect(root,&client)) return false;
+        POINT origin{client.left,client.top}, end{client.right,client.bottom};
+        if (!ClientToScreen(root,&origin) || !ClientToScreen(root,&end)) return false;
+        return covers(RECT{origin.x,origin.y,end.x,end.y});
+    }
+    void normalTaskbarPolicy() {
+        if (!SetPropW(window,L"NonRudeHWND",reinterpret_cast<HANDLE>(static_cast<INT_PTR>(1))))
+            throw_last_error();
+    }
     void leave(bool restore = true) {
         if (!active || changing) return;
         changing = true;
@@ -994,6 +1023,7 @@ class App {
         restoreSystemCursor();
         presenter.IsInputEnabled(false);
         ShowWindow(window, SW_HIDE);
+        normalTaskbarPolicy();
         active = false;
         blackboard.Visibility(Visibility::Collapsed);
         clear(); eraserMode=false; cursorTouch=false;
@@ -1017,6 +1047,10 @@ class App {
         if (!GetMonitorInfoW(monitor, &info)) { changing = false; return; }
         auto r = info.rcMonitor;
         try {
+            // Decide before activating the overlay: activation changes the Shell's
+            // fullscreen assessment of the previous application.
+            if (fullscreenOnMonitor(previous,monitor,r)) RemovePropW(window,L"NonRudeHWND");
+            else normalTaskbarPolicy();
             blackboard.Visibility(Visibility::Collapsed);
             SetWindowPos(window, HWND_TOPMOST, r.left, r.top, r.right-r.left, r.bottom-r.top, 0);
             presenter.IsInputEnabled(tool==Tool::Pen);
@@ -1032,6 +1066,7 @@ class App {
         } catch (...) {
             changing = false;
             ShowWindow(window,SW_HIDE); active=false; restoreSystemCursor();
+            normalTaskbarPolicy();
             throw;
         }
     }
