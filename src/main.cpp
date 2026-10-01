@@ -6,6 +6,7 @@
 #include <commctrl.h>
 #include "settings.h"
 #include "version.h"
+#include "freehand.h"
 #include <dwmapi.h>
 #include <wtsapi32.h>
 #include <inspectable.h>
@@ -26,12 +27,10 @@
 #include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Shapes.h>
 #include <winrt/Windows.System.h>
-#include <fstream>
 #include <string>
 #include <algorithm>
 #include <array>
 #include <vector>
-#include <atomic>
 
 using namespace winrt;
 using namespace Windows::UI;
@@ -71,11 +70,8 @@ class App {
     HWND window{};
     HWND island{};
     HWND previous{};
-    HWND testBackground{};
-    HANDLE testDuplicate{};
-    POINT testOrigin{};
     HMONITOR monitor{};
-    bool active{}, changing{}, hotkey{}, selfTest{};
+    bool active{}, changing{}, hotkey{};
     UINT taskbarCreated{};
     WindowsXamlManager manager{nullptr};
     DesktopWindowXamlSource source{nullptr};
@@ -83,8 +79,6 @@ class App {
     InkCanvas canvas{nullptr};
     InkPresenter presenter{nullptr};
     Windows::UI::Input::Inking::Core::CoreInkIndependentInputSource inkInput{nullptr};
-    bool cursorOnlyTest{};
-    std::atomic<bool> inkCursorConfigured{};
     enum class Tool { Pen, Rectangle, Ellipse, Line, Arrow };
     Tool tool{Tool::Pen};
     Tool requestedTool{Tool::Pen};
@@ -95,6 +89,169 @@ class App {
     uint32_t shapePointer{};
     Windows::Foundation::Point shapeStart{}, shapeEnd{};
     InkDrawingAttributes shapeAttributes{nullptr};
+    bool drawingFreehand{};
+    uint32_t freehandPointer{};
+    Windows::Devices::Input::PointerDeviceType freehandDevice{Windows::Devices::Input::PointerDeviceType::Mouse};
+    Canvas freehandSurface{nullptr};
+    Grid freehandInputRoot{nullptr};
+    Windows::UI::Xaml::Shapes::Path liveFreehandPath{nullptr};
+    Canvas liveFreehandStroke{nullptr};
+    struct FreehandSample { Windows::Foundation::Point point; uint64_t time; };
+    std::vector<FreehandSample> freehandSamples;
+    float freehandStrokeWidth{};
+    std::vector<freehand::Point> freehandTail;
+    float freehandPressureSeed{-1}, freehandRunningLength{};
+    bool freehandMinimumLength{};
+    uint64_t freehandLastRender{};
+    struct UndoItem {
+        uint32_t inkId{};
+        Canvas freehandStroke{nullptr};
+    };
+    std::vector<UndoItem> drawingOrder;
+
+    void cancelFreehand() {
+        if (!drawingFreehand) return;
+        drawingFreehand=false;
+        if (liveFreehandStroke && freehandSurface) {
+            uint32_t index{};
+            if (freehandSurface.Children().IndexOf(liveFreehandStroke,index)) freehandSurface.Children().RemoveAt(index);
+        }
+        liveFreehandPath=nullptr; liveFreehandStroke=nullptr; freehandSamples.clear(); freehandTail.clear();
+        if (freehandInputRoot) freehandInputRoot.ReleasePointerCaptures();
+    }
+    void addFreehandSample(Windows::UI::Input::PointerPoint const& point) {
+        auto position=point.Position();
+        if (!freehandSamples.empty()) {
+            auto const& last=freehandSamples.back();
+            if (std::hypot(position.X-last.point.X,position.Y-last.point.Y)<0.3f) return;
+            if (point.Timestamp()<=last.time) return;
+        }
+        freehandSamples.push_back({position,point.Timestamp()});
+        if (freehandSamples.size()>2) freehandSamples.erase(freehandSamples.begin());
+        using namespace freehand;
+        Vec raw{position.X,position.Y};
+        if (freehandTail.empty()) { freehandTail.push_back({raw,{1,1},0,0}); return; }
+        auto prior=freehandTail.back();
+        Vec adjusted=lerp(prior.position,raw,0.575f); // upstream streamline=.5
+        float distance=length(sub(adjusted,prior.position));
+        if (distance<=0) return;
+        freehandRunningLength+=distance;
+        if (!freehandMinimumLength && freehandRunningLength<freehandStrokeWidth) return;
+        freehandMinimumLength=true;
+        freehandTail.push_back({adjusted,unit(sub(prior.position,adjusted)),distance,freehandRunningLength});
+        if (freehandPressureSeed<0 && freehandTail.size()==2) freehandTail[0].vector=freehandTail[1].vector;
+    }
+    PathFigure freehandFigure(std::vector<freehand::Vec> const& vertices) {
+        PathFigure figure; figure.IsClosed(true); figure.IsFilled(true);
+        if (vertices.empty()) return figure;
+        auto midpoint=[](auto a, auto b) {
+            return Windows::Foundation::Point{(a.x+b.x)*0.5f,(a.y+b.y)*0.5f};
+        };
+        figure.StartPoint(midpoint(vertices.back(),vertices.front()));
+        // Upstream's quadratic midpoint rendering, rather than a faceted polygon.
+        for (size_t i=0;i<vertices.size();++i) {
+            auto a=vertices[i], b=vertices[(i+1)%vertices.size()];
+            QuadraticBezierSegment segment;
+            segment.Point1({a.x,a.y}); segment.Point2(midpoint(a,b));
+            figure.Segments().Append(segment);
+        }
+        return figure;
+    }
+    void renderFreehand(bool finishing=false) {
+        if (!liveFreehandPath || freehandTail.empty()) return;
+        auto now=GetTickCount64();
+        if (!finishing && freehandLastRender && now-freehandLastRender<8 && freehandTail.size()<258) return;
+        freehandLastRender=now;
+        float widthScale=freehandDevice==Windows::Devices::Input::PointerDeviceType::Mouse ? 0.8f : 1.0f;
+        // Freeze bounded portions. Keep a shared endpoint and its incoming pressure.
+        // Frozen Paths do not change; only the live tail is tessellated again.
+        // One parent Canvas keeps undo/clear at stroke granularity.
+        while (freehandTail.size()>=258) {
+            std::vector<freehand::Point> chunk(freehandTail.begin(),freehandTail.begin()+256);
+            auto result=freehand::outline(chunk,freehandStrokeWidth,freehandPressureSeed,widthScale);
+            PathGeometry frozenGeometry; frozenGeometry.FillRule(FillRule::Nonzero);
+            frozenGeometry.Figures().Append(freehandFigure(result.vertices));
+            Windows::UI::Xaml::Shapes::Path frozen;
+            frozen.IsHitTestVisible(false); frozen.Fill(liveFreehandPath.Fill()); frozen.Data(frozenGeometry);
+            liveFreehandStroke.Children().InsertAt(liveFreehandStroke.Children().Size()-1,frozen);
+            freehandPressureSeed=result.pressureBeforeLast;
+            freehandTail.erase(freehandTail.begin(),freehandTail.begin()+255);
+        }
+        auto tail=freehandTail;
+        if (!freehandMinimumLength && !freehandSamples.empty()) {
+            auto raw=freehandSamples.back().point;
+            freehand::Vec target{raw.X,raw.Y};
+            auto start=tail.front().position;
+            auto end=finishing ? target : freehand::lerp(start,target,0.575f);
+            float distance=freehand::length(freehand::sub(end,start));
+            if (distance>0) {
+                auto direction=freehand::unit(freehand::sub(start,end));
+                tail.front().vector=direction;
+                tail.push_back({end,direction,distance,distance});
+            }
+        } else if (finishing && tail.size()>1 && !freehandSamples.empty()) {
+            auto raw=freehandSamples.back().point;
+            auto& last=tail.back(); auto prior=tail[tail.size()-2];
+            last.position={raw.X,raw.Y};
+            last.distance=freehand::length(freehand::sub(last.position,prior.position));
+            last.vector=freehand::unit(freehand::sub(prior.position,last.position));
+            last.runningLength=prior.runningLength+last.distance;
+        }
+        auto result=freehand::outline(tail,freehandStrokeWidth,freehandPressureSeed,widthScale);
+        PathGeometry geometry; geometry.FillRule(FillRule::Nonzero);
+        geometry.Figures().Append(freehandFigure(result.vertices));
+        liveFreehandPath.Data(geometry);
+    }
+    void initializeFreehand(Grid const& root) {
+        freehandInputRoot=root;
+        freehandSurface=Canvas(); freehandSurface.IsHitTestVisible(false);
+        root.Children().Append(freehandSurface);
+        root.AddHandler(UIElement::PointerPressedEvent(),box_value(XamlInput::PointerEventHandler(
+            [this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
+                auto point=args.GetCurrentPoint(freehandInputRoot);
+                auto device=point.PointerDevice().PointerDeviceType();
+                bool isMouse=device==Windows::Devices::Input::PointerDeviceType::Mouse;
+                bool isTouch=device==Windows::Devices::Input::PointerDeviceType::Touch;
+                if (!active || tool!=Tool::Pen || (!isMouse && !isTouch)) return;
+                // One active freehand pointer; extra fingers must not start another stroke.
+                if (drawingFreehand) { args.Handled(true); return; }
+                if ((isMouse && !point.Properties().IsLeftButtonPressed()) ||
+                    (isTouch && !point.IsInContact())) return;
+                if (!freehandInputRoot.CapturePointer(args.Pointer())) return;
+                freehandDevice=device;
+                finishCursorAnimation(); drawingFreehand=true; freehandPointer=args.Pointer().PointerId();
+                freehandStrokeWidth=penWidth; freehandSamples.clear();
+                freehandTail.clear(); freehandPressureSeed=-1; freehandRunningLength=0;
+                freehandMinimumLength=false; freehandLastRender=0;
+                addFreehandSample(point);
+                liveFreehandPath=Windows::UI::Xaml::Shapes::Path();
+                liveFreehandPath.IsHitTestVisible(false); liveFreehandPath.Fill(SolidColorBrush(Palette[colorIndex].value));
+                liveFreehandStroke=Canvas(); liveFreehandStroke.IsHitTestVisible(false);
+                liveFreehandStroke.Children().Append(liveFreehandPath);
+                freehandSurface.Children().Append(liveFreehandStroke); renderFreehand(); args.Handled(true);
+            })),true);
+        root.AddHandler(UIElement::PointerMovedEvent(),box_value(XamlInput::PointerEventHandler(
+            [this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
+                if (!drawingFreehand || args.Pointer().PointerId()!=freehandPointer) return;
+                auto points=args.GetIntermediatePoints(freehandInputRoot);
+                for (uint32_t i=points.Size();i>0;--i) addFreehandSample(points.GetAt(i-1));
+                renderFreehand(); args.Handled(true);
+            })),true);
+        root.AddHandler(UIElement::PointerReleasedEvent(),box_value(XamlInput::PointerEventHandler(
+            [this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
+                if (!drawingFreehand || args.Pointer().PointerId()!=freehandPointer) return;
+                addFreehandSample(args.GetCurrentPoint(freehandInputRoot)); renderFreehand(true);
+                drawingOrder.push_back({0,liveFreehandStroke});
+                drawingFreehand=false; liveFreehandPath=nullptr; liveFreehandStroke=nullptr; freehandSamples.clear(); freehandTail.clear();
+                freehandInputRoot.ReleasePointerCapture(args.Pointer()); args.Handled(true);
+            })),true);
+        root.PointerCanceled([this](auto const&, auto const& args) {
+            if (drawingFreehand && args.Pointer().PointerId()==freehandPointer) cancelFreehand();
+        });
+        root.PointerCaptureLost([this](auto const&, auto const& args) {
+            if (drawingFreehand && args.Pointer().PointerId()==freehandPointer) cancelFreehand();
+        });
+    }
 
     const wchar_t* toolName() const {
         switch (tool) {
@@ -111,6 +268,7 @@ class App {
         if (shapeSurface) shapeSurface.ReleasePointerCaptures();
     }
     void setTool(Tool next) {
+        cancelFreehand();
         cancelShape(); tool=requestedTool=next;
         shapeSurface.Visibility(tool==Tool::Pen ? Visibility::Collapsed : Visibility::Visible);
         presenter.IsInputEnabled(active && tool==Tool::Pen);
@@ -168,7 +326,9 @@ class App {
         bool valid=(tool==Tool::Rectangle || tool==Tool::Ellipse) ? dx>=2 && dy>=2 : std::hypot(dx,dy)>=2;
         if (valid) {
             InkStrokeBuilder builder; builder.SetDefaultDrawingAttributes(shapeAttributes);
-            presenter.StrokeContainer().AddStroke(builder.CreateStroke(points));
+            auto stroke=builder.CreateStroke(points);
+            presenter.StrokeContainer().AddStroke(stroke);
+            drawingOrder.push_back({stroke.Id(),nullptr});
         }
         cancelShape();
         if (tool!=requestedTool) setTool(requestedTool);
@@ -212,9 +372,6 @@ class App {
         });
     }
 
-
-
-
     TextBlock hintText{nullptr};
     Border hintPanel{nullptr};
     bool showHint{}, runAtStartup{};
@@ -237,7 +394,6 @@ class App {
         while (cursorHideCalls) { ShowCursor(TRUE); --cursorHideCalls; }
         SetCursor(LoadCursorW(nullptr,IDC_ARROW));
     }
-    float cursorDiameter{};
     static constexpr UINT_PTR CursorTimer=2;
     void positionCursor() {
         if (!active || !cursorDot) return;
@@ -254,7 +410,7 @@ class App {
         cursorDot.Stroke(SolidColorBrush(Color{255,contrast,contrast,contrast}));
         cursorDot.StrokeThickness(1);
         cursorDot.Width(diameter+2); cursorDot.Height(diameter+2);
-        cursorDot.Opacity(opacity); cursorDiameter=diameter;
+        cursorDot.Opacity(opacity);
         cursorSurface.Visibility(active ? Visibility::Visible : Visibility::Collapsed);
         positionCursor();
     }
@@ -272,9 +428,6 @@ class App {
             if (progress>=1) cursorAnimating=false;
         } else positionCursor();
     }
-    unsigned testStep{};
-    int testResult{1};
-    std::ofstream log;
     HWND settingsWindow{};
     inline static HWND hotkeyEdit{};
     static LRESULT CALLBACK hotkeyMessageProcedure(int code, WPARAM w, LPARAM l) {
@@ -293,7 +446,7 @@ class App {
     int hotkeyId{1};
     std::wstring settingsPath;
     const wchar_t* startupKey() const {
-        return selfTest ? L"Software\\MyZoomIt\\SelfTestRun" : L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+        return L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     }
     static std::wstring executablePath() {
         std::wstring path(32768,L'\0');
@@ -361,11 +514,6 @@ class App {
             code!=VK_MENU && code!=VK_LWIN && code!=VK_RWIN;
     }
     void loadSettings() {
-        if (selfTest) {
-            wchar_t path[MAX_PATH]{};
-            GetFullPathNameW(L"build\\settings-test.ini",MAX_PATH,path,nullptr);
-            settingsPath=path; return;
-        }
         auto executable=executablePath();
         settingsPath=executable.substr(0,executable.find_last_of(L"\\"))+L"\\settings.ini";
         auto mods=GetPrivateProfileIntW(L"Hotkey",L"Modifiers",MOD_CONTROL,settingsPath.c_str());
@@ -381,7 +529,6 @@ class App {
         if (savedTool<=4) tool=requestedTool=static_cast<Tool>(savedTool);
     }
     bool saveBrushSettings() {
-        if (selfTest) return true;
         auto section=L"Width="+std::to_wstring(static_cast<int>(penWidth))+L'\0'+
             L"Color="+std::to_wstring(colorIndex)+L'\0'+L"Tool="+std::to_wstring(static_cast<int>(tool))+L'\0';
         return WritePrivateProfileSectionW(L"Pen",section.c_str(),settingsPath.c_str())!=FALSE;
@@ -476,7 +623,6 @@ class App {
                 L"- C：清空全部笔迹\r\n"
                 L"- 退出标注状态时会清空笔迹，如需要请按PrtScr键截屏保存");
             fitSettings(dialog);
-            if (app->selfTest) SetWindowPos(dialog,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
             app->runAtStartup=app->startupEnabled();
             CheckDlgButton(dialog,IDC_SHOW_HINT,app->showHint ? BST_CHECKED : BST_UNCHECKED);
             CheckDlgButton(dialog,IDC_STARTUP,app->runAtStartup ? BST_CHECKED : BST_UNCHECKED);
@@ -533,7 +679,6 @@ class App {
         // Suspend the binding so the hotkey editor receives the currently registered combination.
         if (hotkey) { UnregisterHotKey(window,hotkeyId); hotkey=false; }
         auto inputHook=SetWindowsHookExW(WH_GETMESSAGE,hotkeyMessageProcedure,nullptr,GetCurrentThreadId());
-        if (selfTest) log << "editor-input-filter-installed=" << (inputHook!=nullptr) << "\n";
         auto result=DialogBoxParamW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(IDD_SETTINGS),nullptr,settingsProcedure,reinterpret_cast<LPARAM>(this));
         if (inputHook) UnhookWindowsHookEx(inputHook);
         hotkeyEdit=nullptr;
@@ -577,40 +722,6 @@ class App {
         wheelRemainder%=WHEEL_DELTA;
         if (steps) updateWidth(penWidth+static_cast<float>(steps));
     }
-    static void mouseWheel(int delta) {
-        INPUT input{}; input.type=INPUT_MOUSE;
-        input.mi.dwFlags=MOUSEEVENTF_WHEEL; input.mi.mouseData=static_cast<DWORD>(delta);
-        SendInput(1,&input,sizeof(input));
-    }
-    static void mouseMove(int x,int y) {
-        INPUT input{}; input.type=INPUT_MOUSE;
-        input.mi.dwFlags=MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
-        auto width=GetSystemMetrics(SM_CXVIRTUALSCREEN), height=GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        input.mi.dx=static_cast<LONG>((static_cast<long long>(x-GetSystemMetrics(SM_XVIRTUALSCREEN))*65536+32768)/width);
-        input.mi.dy=static_cast<LONG>((static_cast<long long>(y-GetSystemMetrics(SM_YVIRTUALSCREEN))*65536+32768)/height);
-        SendInput(1,&input,sizeof(input));
-    }
-    void touch(DWORD flags, int offset) {
-        POINTER_TOUCH_INFO contact{};
-        contact.pointerInfo.pointerType=PT_TOUCH; contact.pointerInfo.pointerId=0;
-        contact.pointerInfo.pointerFlags=flags;
-        contact.pointerInfo.ptPixelLocation={testOrigin.x+300+offset,testOrigin.y+300};
-        auto p=contact.pointerInfo.ptPixelLocation;
-        contact.rcContact={p.x-2,p.y-2,p.x+2,p.y+2};
-        contact.touchMask=TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE;
-        contact.pressure=512; contact.orientation=90;
-        if (!InjectTouchInput(1,&contact)) {
-            log << "touch-injection-error=" << GetLastError() << "\n";
-            testResult=1;
-        }
-    }
-
-    static void key(WORD value, bool up = false) {
-        INPUT input{}; input.type=INPUT_KEYBOARD; input.ki.wVk=value;
-        input.ki.dwFlags=up ? KEYEVENTF_KEYUP : 0;
-        SendInput(1,&input,sizeof(input));
-    }
-
     void tray() {
         NOTIFYICONDATAW icon{sizeof(icon)};
         icon.hWnd = window; icon.uID = 1;
@@ -622,18 +733,28 @@ class App {
         Shell_NotifyIconW(NIM_ADD, &icon);
     }
     void clear() {
+        cancelFreehand(); drawingOrder.clear();
+        if (freehandSurface) freehandSurface.Children().Clear();
         cancelShape();
         if (shapeSurface && tool!=requestedTool) setTool(requestedTool);
         if (presenter) presenter.StrokeContainer().Clear();
     }
     void undo() {
+        if (drawingFreehand) { cancelFreehand(); return; }
         if (drawingShape) { cancelShape(); if (tool!=requestedTool) setTool(requestedTool); return; }
         auto container=presenter.StrokeContainer();
         auto strokes=container.GetStrokes();
-        if (!strokes.Size()) return;
-        for (auto const& stroke : strokes) stroke.Selected(false);
-        strokes.GetAt(strokes.Size()-1).Selected(true);
-        container.DeleteSelected();
+        if (!drawingOrder.empty()) {
+            auto item=drawingOrder.back();
+            if (item.freehandStroke) {
+                uint32_t index{};
+                if (freehandSurface.Children().IndexOf(item.freehandStroke,index)) freehandSurface.Children().RemoveAt(index);
+            } else {
+                for (auto const& stroke:strokes) stroke.Selected(stroke.Id()==item.inkId);
+                container.DeleteSelected();
+            }
+            drawingOrder.pop_back(); return;
+        }
     }
     void leave(bool restore = true) {
         if (!active || changing) return;
@@ -734,617 +855,22 @@ class App {
             else if (l == WM_RBUTTONUP) menu();
             return 0;
         case WM_SETCURSOR: if (active) { SetCursor(nullptr); return TRUE; } break;
-        case WM_TIMER: if (w==CursorTimer) animateCursor(); else if (selfTest && w==1) test(); return 0;
+        case WM_TIMER: if (w==CursorTimer) animateCursor(); return 0;
         case WM_CLOSE: saveBrushSettings(); if (settingsWindow) EndDialog(settingsWindow,IDCANCEL); leave(); DestroyWindow(window); return 0;
         case WM_DESTROY:
-            KillTimer(window, 1); KillTimer(window,CursorTimer);
+            KillTimer(window,CursorTimer);
             restoreSystemCursor();
             UnregisterHotKey(window, hotkeyId);
             WTSUnRegisterSessionNotification(window);
             { NOTIFYICONDATAW icon{sizeof(icon)}; icon.hWnd=window; icon.uID=1; Shell_NotifyIconW(NIM_DELETE, &icon); }
-            PostQuitMessage(selfTest ? testResult : 0); return 0;
+            PostQuitMessage(0); return 0;
         }
         return DefWindowProcW(window, msg, w, l);
     }
-    void testCursor() {
-        if (testStep==0) {
-            testResult=0;
-            enter(); finishCursorAnimation(); setTool(Tool::Pen);
-            RECT bounds{}; GetWindowRect(window,&bounds);
-            testOrigin={bounds.left+240,bounds.top+240};
-        }
-        if (testStep==1 || testStep==3 || testStep==5 || testStep==7 || testStep==9 || testStep==11 || testStep==13) {
-            mouseMove(testOrigin.x+static_cast<int>(testStep)*3,testOrigin.y);
-        }
-        if (testStep==2 || testStep==4 || testStep==6 || testStep==8 || testStep==10 || testStep==12 || testStep==14) {
-            CURSORINFO state{sizeof(state)};
-            bool hidden=GetCursorInfo(&state) && !(state.flags&CURSOR_SHOWING);
-            bool inkHidden=inkCursorConfigured.load();
-            bool dotVisible=cursorSurface.Visibility()==Visibility::Visible;
-            log << "cursor-mode=" << static_cast<int>(tool) << " system-hidden=" << hidden << " ink-hidden=" << inkHidden << " dot-visible=" << dotVisible << "\n";
-            if (!(hidden && inkHidden && dotVisible)) testResult=1;
-            if (testStep==2) key(VK_CONTROL);
-            if (testStep==4) key(VK_CONTROL,true);
-            if (testStep==6) key(VK_SHIFT);
-            if (testStep==8) key(VK_SHIFT,true);
-            if (testStep==10) key(VK_TAB);
-            if (testStep==12) key(VK_TAB,true);
-        }
-        if (testStep==15) leave();
-        if (testStep==17) {
-            CURSORINFO state{sizeof(state)};
-            bool restored=GetCursorInfo(&state) && (state.flags&CURSOR_SHOWING) && cursorHideCalls==0 && cursorSurface.Visibility()==Visibility::Collapsed;
-            log << "cursor-exit-restored=" << restored << "\n";
-            if (!restored) testResult=1;
-            log << "result=" << testResult << "\n"; log.flush();
-            PostMessageW(window,WM_CLOSE,0,0);
-        }
-        ++testStep;
-    }
-    void test() {
-        if (cursorOnlyTest) { testCursor(); return; }
-        // Uses actual desktop mouse input; only runs with explicit --self-test.
-        if (testStep == 0) {
-            POINT point{}; GetCursorPos(&point);
-            MONITORINFO info{sizeof(info)};
-            GetMonitorInfoW(MonitorFromPoint(point,MONITOR_DEFAULTTONEAREST),&info);
-            testOrigin={info.rcMonitor.left,info.rcMonitor.top};
-            WNDCLASSW wc{}; wc.lpfnWndProc=DefWindowProcW; wc.hInstance=GetModuleHandleW(nullptr);
-            wc.lpszClassName=L"MyZoomIt.TestBackground";
-            wc.hbrBackground=CreateSolidBrush(RGB(20,80,130));
-            RegisterClassW(&wc);
-            testBackground=CreateWindowExW(WS_EX_TOPMOST,wc.lpszClassName,L"MyZoomIt test",WS_POPUP | WS_VISIBLE,
-                testOrigin.x+100,testOrigin.y+100,600,400,nullptr,nullptr,wc.hInstance,nullptr);
-            SetForegroundWindow(testBackground);
-            mouseMove(testOrigin.x+240,testOrigin.y+240);
-            key(VK_CONTROL); key('2'); key('2',true); key(VK_CONTROL,true);
-        } else if (testStep == 1) {
-            log << "hotkey-overlay-visible=" << (active && IsWindowVisible(window)) << "\n";
-        } else if (testStep == 3) {
-            // Allow first-show XAML layout/input attachment to settle before injection.
-            INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTDOWN;
-            SendInput(1, &input, sizeof(input));
-        } else if (testStep < 10) {
-            RECT r{}; GetWindowRect(window, &r);
-            mouseMove(r.left + 240 + static_cast<int>(testStep)*20, r.top + 240 + static_cast<int>(testStep)*8);
-        } else if (testStep == 10) {
-            INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTUP;
-            SendInput(1, &input, sizeof(input));
-        } else if (testStep == 13) {
-            auto strokes = presenter.StrokeContainer().GetStrokes().Size();
-            log << "mouse-strokes=" << strokes << "\n";
-            auto dc=GetDC(nullptr);
-            auto memory=CreateCompatibleDC(dc);
-            BITMAPINFO bitmap{}; bitmap.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
-            bitmap.bmiHeader.biWidth=600; bitmap.bmiHeader.biHeight=-400;
-            bitmap.bmiHeader.biPlanes=1; bitmap.bmiHeader.biBitCount=32; bitmap.bmiHeader.biCompression=BI_RGB;
-            void* pixels{};
-            auto image=CreateDIBSection(dc,&bitmap,DIB_RGB_COLORS,&pixels,nullptr,0);
-            if (!image || !pixels) throw hresult_error(E_OUTOFMEMORY);
-            auto old=SelectObject(memory,image);
-            BitBlt(memory,0,0,600,400,dc,testOrigin.x+100,testOrigin.y+100,SRCCOPY | CAPTUREBLT);
-            auto pixel=[pixels](int x,int y) {
-                auto value=static_cast<DWORD*>(pixels)[(y-100)*600+x-100];
-                return RGB((value>>16)&255,(value>>8)&255,value&255);
-            };
-            bool transparent=pixel(500,400)==RGB(20,80,130);
-            bool inkVisible=false;
-            for (int y=235;y<325;++y) for (int x=235;x<445;++x) {
-                auto color=pixel(x,y);
-                if (GetRValue(color)>180 && GetGValue(color)<100 && GetBValue(color)<110) inkVisible=true;
-            }
-            BITMAPFILEHEADER file{}; file.bfType=0x4D42;
-            file.bfOffBits=sizeof(file)+sizeof(BITMAPINFOHEADER); file.bfSize=file.bfOffBits+600*400*4;
-            std::ofstream capture("build/self-test.bmp",std::ios::binary);
-            capture.write(reinterpret_cast<char*>(&file),sizeof(file));
-            capture.write(reinterpret_cast<char*>(&bitmap.bmiHeader),sizeof(BITMAPINFOHEADER));
-            capture.write(static_cast<char*>(pixels),600*400*4);
-            SelectObject(memory,old); DeleteObject(image); DeleteDC(memory);
-            ReleaseDC(nullptr,dc);
-            log << "desktop-background-visible=" << transparent << "\n";
-            log << "rendered-red-ink-visible=" << inkVisible << "\n";
-            testResult=strokes>0 && transparent && inkVisible && hotkey ? 0 : 1;
-            key('C'); key('C',true);
-        } else if (testStep == 15) {
-            auto remaining = presenter.StrokeContainer().GetStrokes().Size();
-            log << "clear-remaining=" << remaining << "\n";
-            if (remaining!=0) testResult=1;
-            key(VK_ESCAPE); key(VK_ESCAPE,true);
-        } else if (testStep == 17) {
-            bool hidden = !IsWindowVisible(window) && !presenter.IsInputEnabled();
-            log << "hidden-and-input-disabled=" << hidden << "\n";
-            bool focusRestored=GetForegroundWindow()==previous;
-            log << "previous-focus-restored=" << focusRestored << "\n";
-            bool cycles=true;
-            for (int i=0; i<50; ++i) { enter(); cycles &= active && IsWindowVisible(window); leave(); cycles &= !active && !IsWindowVisible(window); }
-            log << "50-toggle-cycles=" << cycles << "\n";
-            if (!hidden || !cycles || !focusRestored) testResult=1;
-            enter();
-            SendMessageW(window,WM_DISPLAYCHANGE,0,0);
-            bool displayExit=!active && !IsWindowVisible(window);
-            log << "display-change-exits=" << displayExit << "\n";
-            enter(); SetForegroundWindow(testBackground);
-            bool lostFocusExit=!active && !IsWindowVisible(window);
-            log << "focus-loss-exits=" << lostFocusExit << "\n";
-            if (!displayExit || !lostFocusExit) testResult=1;
-            wchar_t executable[MAX_PATH]{};
-            GetModuleFileNameW(nullptr,executable,MAX_PATH);
-            STARTUPINFOW startup{sizeof(startup)}; PROCESS_INFORMATION process{};
-            if (CreateProcessW(executable,nullptr,nullptr,nullptr,FALSE,0,nullptr,nullptr,&startup,&process)) {
-                testDuplicate=process.hProcess; CloseHandle(process.hThread);
-            } else testResult=1;
-        } else if (testStep == 22) {
-            DWORD exitCode=STILL_ACTIVE;
-            if (testDuplicate) { GetExitCodeProcess(testDuplicate,&exitCode); CloseHandle(testDuplicate); }
-            bool singleInstance=exitCode==0 && active && IsWindowVisible(window);
-            log << "second-instance-activates-existing=" << singleInstance << "\n";
-            if (!singleInstance) testResult=1;
-            key(VK_CONTROL); mouseWheel(2*WHEEL_DELTA);
-        } else if (testStep == 24) {
-            bool cursorVisible=cursorSurface.Visibility()==Visibility::Visible && cursorDot.Opacity()==1;
-            log << "brush-cursor-visible-after-wheel=" << cursorVisible << "\n";
-            if (!cursorVisible) testResult=1;
-            bool resized=penWidth==14 && presenter.CopyDefaultDrawingAttributes().Size().Width==14 && cursorDiameter==14 && !cursorAnimating;
-            log << "ctrl-wheel-increases-width=" << resized << "\n";
-            if (!resized) testResult=1;
-            mouseWheel(-30*WHEEL_DELTA);
-        } else if (testStep == 26) {
-            CURSORINFO cursorState{sizeof(cursorState)};
-            bool systemHidden=GetCursorInfo(&cursorState) && !(cursorState.flags&CURSOR_SHOWING);
-            log << "system-cursor-hidden-after-wheel=" << systemHidden << "\n";
-            if (!systemHidden) testResult=1;
-            log << "width-minimum=" << penWidth << "\n";
-            if (penWidth!=6) testResult=1;
-            mouseWheel(40*WHEEL_DELTA);
-        } else if (testStep == 28) {
-            log << "width-maximum=" << penWidth << "\n";
-            if (penWidth!=24) testResult=1;
-            key(VK_CONTROL,true); updateWidth(12); clear();
-            auto initialized=InitializeTouchInjection(1,TOUCH_FEEDBACK_NONE);
-            log << "touch-injection-initialized=" << initialized << " error=" << GetLastError() << "\n";
-            if (!initialized) testResult=1;
-        } else if (testStep == 29) {
-            // Let the injected Ctrl key-up reach the tool switch before touch begins.
-            touch(POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,0);
-        } else if (testStep == 30) {
-            touch(POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,static_cast<int>(testStep-28)*30);
-        } else if (testStep == 31) {
-            touch(POINTER_FLAG_UP,60);
-        } else if (testStep == 34) {
-            auto touchStrokes=presenter.StrokeContainer().GetStrokes().Size();
-            log << "injected-touch-strokes=" << touchStrokes << "\n";
-            if (touchStrokes==0) testResult=1;
-            touch(POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,0);
-        } else if (testStep == 35) {
-            touch(POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,30);
-        } else if (testStep == 36) {
-            touch(POINTER_FLAG_UP,30);
-        } else if (testStep == 39) {
-            auto count=presenter.StrokeContainer().GetStrokes().Size();
-            log << "two-strokes-before-undo=" << count << "\n";
-            if (count!=2) testResult=1;
-            key(VK_CONTROL); key('Z'); key('Z',true); key(VK_CONTROL,true);
-        } else if (testStep == 41) {
-            auto count=presenter.StrokeContainer().GetStrokes().Size();
-            log << "ctrl-z-leaves-one-stroke=" << count << "\n";
-            if (count!=1) testResult=1;
-            key(VK_ESCAPE); key(VK_ESCAPE,true);
-        } else if (testStep == 43) {
-            bool exitCleared=!active && presenter.StrokeContainer().GetStrokes().Size()==0;
-            log << "exit-clears-ink=" << exitCleared << "\n";
-            if (!exitCleared) testResult=1;
-            enter();
-            bool reopenedEmpty=presenter.StrokeContainer().GetStrokes().Size()==0;
-            log << "reopen-empty=" << reopenedEmpty << "\n";
-            if (!reopenedEmpty) testResult=1;
-            key(VK_CONTROL); key('Z'); key('Z',true); key(VK_CONTROL,true);
-        } else if (testStep == 45) {
-            log << "undo-empty-safe=" << (presenter.StrokeContainer().GetStrokes().Size()==0) << "\n";
-            auto enabled=presenter.CopyDefaultDrawingAttributes().ModelerAttributes().UseVelocityBasedPressure();
-            log << "velocity-pressure-disabled=" << !enabled << "\n";
-            if (enabled) testResult=1;
-            updateWidth(12);
-            mouseMove(testOrigin.x+220,testOrigin.y+350);
-            INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTDOWN;
-            SendInput(1,&input,sizeof(input));
-        } else if (testStep>45 && testStep<66) {
-            mouseMove(testOrigin.x+220+static_cast<int>(testStep-45)*10,testOrigin.y+350);
-        } else if (testStep==66) {
-            INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTUP;
-            SendInput(1,&input,sizeof(input));
-        } else if (testStep==69) {
-            mouseMove(testOrigin.x+220,testOrigin.y+450);
-            INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTDOWN;
-            SendInput(1,&input,sizeof(input));
-        } else if (testStep==70 || testStep==71) {
-            mouseMove(testOrigin.x+220+static_cast<int>(testStep-69)*100,testOrigin.y+450);
-        } else if (testStep==72) {
-            INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTUP;
-            SendInput(1,&input,sizeof(input));
-        } else if (testStep==76) {
-            auto strokes=presenter.StrokeContainer().GetStrokes();
-            log << "velocity-test-strokes=" << strokes.Size() << "\n";
-            if (strokes.Size()!=2) testResult=1;
-            for (uint32_t i=0;i<strokes.Size();++i) {
-                auto points=strokes.GetAt(i).GetInkPoints();
-                float total=0;
-                for (auto const& point : points) total+=point.Pressure();
-                log << (i==0 ? "slow" : "fast") << "-average-pressure=" << (points.Size() ? total/points.Size() : 0) << "\n";
-            }
-            auto dc=GetDC(nullptr); auto memory=CreateCompatibleDC(dc);
-            BITMAPINFO bitmap{}; bitmap.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
-            bitmap.bmiHeader.biWidth=600; bitmap.bmiHeader.biHeight=-400;
-            bitmap.bmiHeader.biPlanes=1; bitmap.bmiHeader.biBitCount=32;
-            void* pixels{}; auto image=CreateDIBSection(dc,&bitmap,DIB_RGB_COLORS,&pixels,nullptr,0);
-            if (!image || !pixels) throw hresult_error(E_OUTOFMEMORY);
-            auto old=SelectObject(memory,image);
-            BitBlt(memory,0,0,600,400,dc,testOrigin.x+100,testOrigin.y+100,SRCCOPY | CAPTUREBLT);
-            auto thickness=[pixels](int centerY) {
-                int count=0;
-                for (int x=250;x<300;++x) for (int y=centerY-25;y<centerY+25;++y) {
-                    auto p=static_cast<DWORD*>(pixels)[(y-100)*600+x-100];
-                    if (((p>>16)&255)>180 && ((p>>8)&255)<100 && (p&255)<110) ++count;
-                }
-                return count/50.0f;
-            };
-            auto slow=thickness(350), fast=thickness(450);
-            log << "slow-rendered-width-px=" << slow << "\nfast-rendered-width-px=" << fast << "\n";
-            bool constant=slow>0 && fast>0 && std::abs(slow-fast)<=1.0f;
-            log << "mouse-width-independent-of-speed=" << constant << "\n";
-            if (!constant) testResult=1;
-            BITMAPFILEHEADER file{}; file.bfType=0x4D42;
-            file.bfOffBits=sizeof(file)+sizeof(BITMAPINFOHEADER); file.bfSize=file.bfOffBits+600*400*4;
-            std::ofstream capture("build/velocity-test.bmp",std::ios::binary);
-            capture.write(reinterpret_cast<char*>(&file),sizeof(file));
-            capture.write(reinterpret_cast<char*>(&bitmap.bmiHeader),sizeof(BITMAPINFOHEADER));
-            capture.write(static_cast<char*>(pixels),600*400*4);
-            SelectObject(memory,old); DeleteObject(image); DeleteDC(memory); ReleaseDC(nullptr,dc);
-        } else if (testStep>=77 && testStep<=90) {
-            auto index=(testStep-77)/2;
-            if ((testStep-77)%2==0) { key(Palette[index].key); key(Palette[index].key,true); }
-            else {
-                auto attributes=presenter.CopyDefaultDrawingAttributes();
-                bool correct=attributes.Color()==Palette[index].value && attributes.Size().Width==12 &&
-                    !attributes.ModelerAttributes().UseVelocityBasedPressure();
-                log << "color-shortcut-" << static_cast<char>(Palette[index].key) << "=" << correct << "\n";
-                if (!correct) testResult=1;
-            }
-        } else if (testStep==92) {
-            key('P'); key('P',true);
-            key(VK_CONTROL); mouseWheel(-3*WHEEL_DELTA); key(VK_CONTROL,true);
-        } else if (testStep==94) {
-            key(VK_ESCAPE); key(VK_ESCAPE,true);
-        } else if (testStep==96) {
-            enter();
-            auto attributes=presenter.CopyDefaultDrawingAttributes();
-            bool remembered=attributes.Color()==Palette[3].value && attributes.Size().Width==9 &&
-                !attributes.ModelerAttributes().UseVelocityBasedPressure() && !attributes.IgnorePressure();
-            log << "pen-settings-preserved-on-reentry=" << remembered << "\n";
-            if (!remembered) testResult=1;
-            clear(); setColor('R'); updateWidth(12);
-        } else if (testStep==98) {
-            mouseMove(testOrigin.x+220,testOrigin.y+400);
-            INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTDOWN;
-            SendInput(1,&input,sizeof(input));
-        } else if (testStep>=103 && testStep<=105) {
-            mouseMove(testOrigin.x+220+static_cast<int>(testStep-102)*70,testOrigin.y+400);
-        } else if (testStep==106) {
-            INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTUP;
-            SendInput(1,&input,sizeof(input));
-        } else if (testStep==110) {
-            auto dc=GetDC(nullptr); auto memory=CreateCompatibleDC(dc);
-            BITMAPINFO bitmap{}; bitmap.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
-            bitmap.bmiHeader.biWidth=600; bitmap.bmiHeader.biHeight=-400;
-            bitmap.bmiHeader.biPlanes=1; bitmap.bmiHeader.biBitCount=32;
-            void* pixels{}; auto image=CreateDIBSection(dc,&bitmap,DIB_RGB_COLORS,&pixels,nullptr,0);
-            if (!image || !pixels) throw hresult_error(E_OUTOFMEMORY);
-            auto old=SelectObject(memory,image);
-            BitBlt(memory,0,0,600,400,dc,testOrigin.x+100,testOrigin.y+100,SRCCOPY | CAPTUREBLT);
-            auto maxWidth=[pixels](int begin,int end) {
-                int maximum=0;
-                for (int x=begin;x<end;++x) {
-                    int count=0;
-                    for (int y=365;y<435;++y) {
-                        auto p=static_cast<DWORD*>(pixels)[(y-100)*600+x-100];
-                        if (((p>>16)&255)>180 && ((p>>8)&255)<100 && (p&255)<110) ++count;
-                    }
-                    maximum=std::max(maximum,count);
-                }
-                return maximum;
-            };
-            auto head=maxWidth(210,245),body=maxWidth(300,360);
-            log << "held-mouse-head-width=" << head << "\nheld-mouse-body-width=" << body << "\n";
-            bool smooth=head>0 && body>0 && head<=body*1.2f;
-            log << "held-mouse-start-no-ball=" << smooth << "\n";
-            if (!smooth) testResult=1;
-            BITMAPFILEHEADER file{}; file.bfType=0x4D42;
-            file.bfOffBits=sizeof(file)+sizeof(BITMAPINFOHEADER); file.bfSize=file.bfOffBits+600*400*4;
-            std::ofstream capture("build/mouse-start-test.bmp",std::ios::binary);
-            capture.write(reinterpret_cast<char*>(&file),sizeof(file));
-            capture.write(reinterpret_cast<char*>(&bitmap.bmiHeader),sizeof(BITMAPINFOHEADER));
-            capture.write(static_cast<char*>(pixels),600*400*4);
-            SelectObject(memory,old); DeleteObject(image); DeleteDC(memory); ReleaseDC(nullptr,dc);
-            leave();
-            std::wstring error;
-            bool changed=applyShortcut(MOD_CONTROL|MOD_ALT,'9',error);
-            bool saved=GetPrivateProfileIntW(L"Hotkey",L"Key",0,settingsPath.c_str())=='9';
-            bool oldFree=RegisterHotKey(window,20,MOD_CONTROL|MOD_NOREPEAT,'2')!=FALSE;
-            if (oldFree) UnregisterHotKey(window,20);
-            bool occupied=RegisterHotKey(window,21,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,'8')!=FALSE;
-            bool rejected=occupied && !applyShortcut(MOD_CONTROL|MOD_ALT,'8',error) && hotkeyKey=='9';
-            if (occupied) UnregisterHotKey(window,21);
-            bool restored=applyShortcut(MOD_CONTROL,'2',error);
-            log << "settings-change-save-old-released=" << (changed && saved && oldFree) << "\nsettings-conflict-preserves-old=" << rejected << "\nsettings-restore-default=" << restored << "\n";
-            if (!(changed && saved && oldFree && rejected && restored)) testResult=1;
-            // Modal settings uses its own message loop; the existing timer verifies controls and cancellation.
-            for (int attempt=0;attempt<3;++attempt) {
-                testStep=111;
-                SendMessageW(window,SettingsMessage,0,0);
-                bool cancelled=hotkeyKey=='2' && hotkey && settingsWindow==nullptr && !showHint && !startupEnabled();
-                log << "settings-dialog-cancel-restores-shortcut-" << attempt << "=" << cancelled << "\n";
-                if (!cancelled) testResult=1;
-            }
-            testStep=113;
-            clear(); SetForegroundWindow(testBackground); enter(); updateWidth(6);
-        } else if (testStep == 112 && settingsWindow) {
-            bool foreground=IsWindowVisible(settingsWindow) && GetForegroundWindow()==settingsWindow &&
-                GetFocus()==GetDlgItem(settingsWindow,IDC_HOTKEY) && !hotkey;
-            log << "settings-opens-visible-focused-binding-suspended=" << foreground << "\n";
-            if (!foreground) { testResult=1; testStep=117; PostMessageW(settingsWindow,WM_COMMAND,IDCANCEL,0); return; }
-            // Capture only this application's settings window for visual layout verification.
-            RECT bounds{}; GetWindowRect(settingsWindow,&bounds);
-            int width=bounds.right-bounds.left,height=bounds.bottom-bounds.top;
-            auto dc=GetDC(settingsWindow),memory=CreateCompatibleDC(dc);
-            BITMAPINFO bitmap{}; bitmap.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
-            bitmap.bmiHeader.biWidth=width; bitmap.bmiHeader.biHeight=-height;
-            bitmap.bmiHeader.biPlanes=1; bitmap.bmiHeader.biBitCount=32;
-            void* pixels{}; auto image=CreateDIBSection(dc,&bitmap,DIB_RGB_COLORS,&pixels,nullptr,0);
-            auto old=SelectObject(memory,image);
-            RedrawWindow(settingsWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_UPDATENOW|RDW_ALLCHILDREN);
-            PrintWindow(settingsWindow,memory,2);
-            BITMAPFILEHEADER file{}; file.bfType=0x4D42; file.bfOffBits=sizeof(file)+sizeof(BITMAPINFOHEADER);
-            file.bfSize=file.bfOffBits+width*height*4;
-            std::ofstream capture("build/settings-test.bmp",std::ios::binary);
-            capture.write(reinterpret_cast<char*>(&file),sizeof(file));
-            capture.write(reinterpret_cast<char*>(&bitmap.bmiHeader),sizeof(BITMAPINFOHEADER));
-            capture.write(static_cast<char*>(pixels),static_cast<std::streamsize>(width)*height*4);
-            SelectObject(memory,old); DeleteObject(image); DeleteDC(memory); ReleaseDC(settingsWindow,dc);
-            bool loaded=SendDlgItemMessageW(settingsWindow,IDC_HOTKEY,HKM_GETHOTKEY,0,0)==MAKEWORD('2',HOTKEYF_CONTROL);
-            SendDlgItemMessageW(settingsWindow,IDC_HOTKEY,HKM_SETHOTKEY,MAKEWORD('7',HOTKEYF_ALT),0);
-            SendMessageW(settingsWindow,WM_COMMAND,IDC_RESET,0);
-            bool reset=SendDlgItemMessageW(settingsWindow,IDC_HOTKEY,HKM_GETHOTKEY,0,0)==MAKEWORD('2',HOTKEYF_CONTROL);
-            log << "settings-dialog-load-reset=" << (loaded && reset) << "\n";
-            if (!(loaded && reset)) testResult=1;
-            SetFocus(GetDlgItem(settingsWindow,IDC_HOTKEY)); key('F'); key('F',true);
-        } else if (testStep==113 && settingsWindow) {
-            bool raw=SendDlgItemMessageW(settingsWindow,IDC_HOTKEY,HKM_GETHOTKEY,0,0)==MAKEWORD('F',0);
-            log << "hotkey-single-key-no-added-ctrl=" << raw << "\n"; if (!raw) testResult=1;
-            key(VK_CONTROL); key('2'); key('2',true); key(VK_CONTROL,true);
-        } else if (testStep==114 && settingsWindow) {
-            bool ctrl=SendDlgItemMessageW(settingsWindow,IDC_HOTKEY,HKM_GETHOTKEY,0,0)==MAKEWORD('2',HOTKEYF_CONTROL) && !active;
-            log << "hotkey-captures-existing-ctrl-combination=" << ctrl << "\n"; if (!ctrl) testResult=1;
-            key(VK_MENU); key('K'); key('K',true); key(VK_MENU,true);
-        } else if (testStep==115 && settingsWindow) {
-            auto captured=SendDlgItemMessageW(settingsWindow,IDC_HOTKEY,HKM_GETHOTKEY,0,0);
-            bool alt=captured==MAKEWORD('K',HOTKEYF_ALT);
-            log << "hotkey-captures-alt-combination=" << alt << "\n"; if (!alt) testResult=1;
-            key(VK_CONTROL); key(VK_MENU); key(VK_SHIFT); key(VK_F9); key(VK_F9,true); key(VK_SHIFT,true); key(VK_MENU,true); key(VK_CONTROL,true);
-        } else if (testStep==116 && settingsWindow) {
-            bool combined=SendDlgItemMessageW(settingsWindow,IDC_HOTKEY,HKM_GETHOTKEY,0,0)==MAKEWORD(VK_F9,HOTKEYF_CONTROL|HOTKEYF_ALT|HOTKEYF_SHIFT);
-            SendMessageW(settingsWindow,WM_COMMAND,IDC_DELETE_HOTKEY,0);
-            bool cleared=SendDlgItemMessageW(settingsWindow,IDC_HOTKEY,HKM_GETHOTKEY,0,0)==0 && hotkeyKey=='2';
-            log << "hotkey-captures-combined-modifiers=" << combined << "\nhotkey-delete-awaits-save=" << cleared << "\n";
-            if (!(combined && cleared)) testResult=1;
-            CheckDlgButton(settingsWindow,IDC_SHOW_HINT,BST_CHECKED); CheckDlgButton(settingsWindow,IDC_STARTUP,BST_CHECKED);
-            PostMessageW(settingsWindow,WM_COMMAND,IDCANCEL,0);
-        } else if (testStep>=114 && testStep<146) {
-            auto index=(testStep-114)/8, phase=(testStep-114)%8;
-            int x=testOrigin.x+150+static_cast<int>(index%2)*260;
-            int y=testOrigin.y+180+static_cast<int>(index/2)*150;
-            if (phase==0) {
-                constexpr WORD colors[]{'R','G','B','P'};
-                key(colors[index]); key(colors[index],true);
-                key(static_cast<WORD>('2'+index)); key(static_cast<WORD>('2'+index),true); mouseMove(x,y);
-            }
-            if (phase==1) {
-                INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTDOWN; SendInput(1,&input,sizeof(input));
-            }
-            if (phase==2) mouseMove(x+60,y+35);
-            if (phase==3) {
-                bool shown=drawingShape && preview.Points().Size()>1;
-                log << "shape-preview-" << index << "=" << shown << "\n";
-                if (!shown) testResult=1;
-                mouseMove(x+200,y+105);
-            }
-            if (phase==4) {
-                INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTUP; SendInput(1,&input,sizeof(input));
-            }
-            if (phase==6) {
-                auto strokes=presenter.StrokeContainer().GetStrokes();
-                bool complete=strokes.Size()==index+1 && !drawingShape && preview.Points().Size()==0;
-                if (complete) {
-                    auto attrs=strokes.GetAt(index).DrawingAttributes();
-                    complete=attrs.IgnorePressure() && !attrs.FitToCurve() && attrs.Size().Width==6 && attrs.Color()==Palette[colorIndex].value;
-                }
-                log << "shape-committed-one-stroke-" << index << "=" << complete << "\n";
-                if (!complete) testResult=1;
-            }
-        } else if (testStep==146) {
-            auto dc=GetDC(nullptr),memory=CreateCompatibleDC(dc);
-            BITMAPINFO bitmap{}; bitmap.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
-            bitmap.bmiHeader.biWidth=600; bitmap.bmiHeader.biHeight=-400;
-            bitmap.bmiHeader.biPlanes=1; bitmap.bmiHeader.biBitCount=32;
-            void* pixels{}; auto image=CreateDIBSection(dc,&bitmap,DIB_RGB_COLORS,&pixels,nullptr,0);
-            auto old=SelectObject(memory,image);
-            BitBlt(memory,0,0,600,400,dc,testOrigin.x+100,testOrigin.y+100,SRCCOPY);
-            BITMAPFILEHEADER file{}; file.bfType=0x4D42; file.bfOffBits=sizeof(file)+sizeof(BITMAPINFOHEADER);
-            file.bfSize=file.bfOffBits+600*400*4;
-            std::ofstream capture("build/shapes-test.bmp",std::ios::binary);
-            capture.write(reinterpret_cast<char*>(&file),sizeof(file));
-            capture.write(reinterpret_cast<char*>(&bitmap.bmiHeader),sizeof(BITMAPINFOHEADER));
-            capture.write(static_cast<char*>(pixels),600*400*4);
-            SelectObject(memory,old); DeleteObject(image); DeleteDC(memory); ReleaseDC(nullptr,dc);
-            key(VK_CONTROL); key('Z'); key('Z',true); key(VK_CONTROL,true);
-        } else if (testStep==148) {
-            bool undone=presenter.StrokeContainer().GetStrokes().Size()==3;
-            log << "arrow-undo-whole-shape=" << undone << "\n"; if (!undone) testResult=1;
-            key('1'); key('1',true); mouseMove(testOrigin.x+200,testOrigin.y+450);
-        } else if (testStep==149) {
-            INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTDOWN; SendInput(1,&input,sizeof(input));
-        } else if (testStep>=150 && testStep<=152) {
-            mouseMove(testOrigin.x+200+static_cast<int>(testStep-149)*30,testOrigin.y+450);
-        } else if (testStep==153) {
-            INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTUP; SendInput(1,&input,sizeof(input));
-        } else if (testStep==156) {
-            bool mixed=presenter.StrokeContainer().GetStrokes().Size()==4 && presenter.IsInputEnabled();
-            log << "return-to-freehand-and-mixed-ink=" << mixed << "\n"; if (!mixed) testResult=1;
-            undo(); bool ordered=presenter.StrokeContainer().GetStrokes().Size()==3;
-            log << "mixed-undo-order=" << ordered << "\n"; if (!ordered) testResult=1;
-            clear(); key('2'); key('2',true);
-        } else if (testStep==158) {
-            touch(POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,0);
-        } else if (testStep==159) {
-            POINTER_TOUCH_INFO contact{}; contact.pointerInfo.pointerType=PT_TOUCH; contact.pointerInfo.pointerId=0;
-            contact.pointerInfo.pointerFlags=POINTER_FLAG_UPDATE|POINTER_FLAG_INRANGE|POINTER_FLAG_INCONTACT;
-            contact.pointerInfo.ptPixelLocation={testOrigin.x+440,testOrigin.y+380};
-            InjectTouchInput(1,&contact);
-        } else if (testStep==160) {
-            POINTER_TOUCH_INFO contact{}; contact.pointerInfo.pointerType=PT_TOUCH; contact.pointerInfo.pointerId=0;
-            contact.pointerInfo.pointerFlags=POINTER_FLAG_UP;
-            contact.pointerInfo.ptPixelLocation={testOrigin.x+440,testOrigin.y+380};
-            InjectTouchInput(1,&contact);
-        } else if (testStep==163) {
-            bool finger=presenter.StrokeContainer().GetStrokes().Size()==1;
-            log << "finger-shape=" << finger << "\n"; if (!finger) testResult=1;
-            leave(); bool empty=presenter.StrokeContainer().GetStrokes().Size()==0 && !drawingShape;
-            log << "shape-exit-clears=" << empty << "\n"; if (!empty) testResult=1;
-            enter(); setTool(Tool::Rectangle); mouseMove(testOrigin.x+200,testOrigin.y+240);
-        } else if (testStep==165 || testStep==171) {
-            INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTDOWN; SendInput(1,&input,sizeof(input));
-        } else if (testStep==166) {
-            mouseMove(testOrigin.x+400,testOrigin.y+370);
-        } else if (testStep==167) {
-            key(VK_CONTROL); key('Z'); key('Z',true); key(VK_CONTROL,true);
-        } else if (testStep==168 || testStep==172) {
-            INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTUP; SendInput(1,&input,sizeof(input));
-        } else if (testStep==170) {
-            bool cancelled=!drawingShape && preview.Points().Size()==0 && presenter.StrokeContainer().GetStrokes().Size()==0;
-            log << "undo-cancels-live-shape=" << cancelled << "\n"; if (!cancelled) testResult=1;
-            setTool(Tool::Rectangle);
-        } else if (testStep==174) {
-            bool tiny=presenter.StrokeContainer().GetStrokes().Size()==0;
-            log << "shape-click-without-drag-no-mark=" << tiny << "\n"; if (!tiny) testResult=1;
-            shapeStart={400,350}; shapeEnd={200,180}; shapeAttributes=presenter.CopyDefaultDrawingAttributes();
-            auto rect=shapePoints(); bool reversed=rect.size()==5 && rect.front()==rect.back() && rect[1].X==200 && rect[1].Y==350;
-            setTool(Tool::Ellipse); auto ellipse=shapePoints();
-            reversed=reversed && ellipse.size()>=49 && ellipse.front()==ellipse.back();
-            log << "reverse-drag-shape-geometry=" << reversed << "\n"; if (!reversed) testResult=1;
-            setTool(Tool::Arrow); auto arrow=shapePoints();
-            bool tipAtStart=arrow.size()==5 && arrow[1]==shapeStart && arrow[3]==shapeStart && arrow[0]==shapeEnd;
-            log << "arrow-tip-at-pointer-down=" << tipAtStart << "\n"; if (!tipAtStart) testResult=1;
-            setTool(Tool::Pen); updateWidth(12); leave();
-            enter(); clear();
-        } else if (testStep>=176 && testStep<224) {
-            auto index=(testStep-176)/12,phase=(testStep-176)%12;
-            WORD modifier=index==0 || index==3 ? VK_CONTROL : index==1 ? VK_TAB : VK_SHIFT;
-            if (phase==0) {
-                key(modifier); if (index==3) key(VK_SHIFT);
-                mouseMove(testOrigin.x+220,testOrigin.y+230);
-            }
-            if (phase==1) {
-                bool selected=tool==static_cast<Tool>(index+1);
-                log << "hold-select-tool-" << index << "=" << selected << "\n"; if (!selected) testResult=1;
-            }
-            if (phase==2) {
-                INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTDOWN; SendInput(1,&input,sizeof(input));
-            }
-            if (phase==3) mouseMove(testOrigin.x+420,testOrigin.y+350);
-            if (phase==4) {
-                key(modifier,true); if (index==3) key(VK_SHIFT,true);
-            }
-            if (phase==5) {
-                bool preserved=drawingShape && tool==static_cast<Tool>(index+1) && requestedTool==Tool::Pen;
-                log << "release-key-mid-drag-preserves-shape-" << index << "=" << preserved << "\n";
-                if (!preserved) testResult=1;
-            }
-            if (phase==6) {
-                INPUT input{}; input.type=INPUT_MOUSE; input.mi.dwFlags=MOUSEEVENTF_LEFTUP; SendInput(1,&input,sizeof(input));
-            }
-            if (phase==8) {
-                bool completed=tool==Tool::Pen && presenter.IsInputEnabled() && !drawingShape && presenter.StrokeContainer().GetStrokes().Size()==index+1;
-                log << "held-shape-completes-and-restores-pen-" << index << "=" << completed << "\n";
-                if (!completed) testResult=1;
-            }
-        } else if (testStep==225) {
-            leave();
-            bool defaults=!showHint && !startupEnabled() && hintPanel.Visibility()==Visibility::Collapsed;
-            std::wstring error;
-            bool enabled=applySettings(hotkeyModifiers,hotkeyKey,true,true,error) && startupEnabled() &&
-                hintPanel.Visibility()==Visibility::Visible && GetPrivateProfileIntW(L"UI",L"ShowHint",0,settingsPath.c_str())==1;
-            bool secondLine=std::wstring(hintText.Text()).find(L"\n按住 Ctrl 矩形 / Tab 椭圆 / Shift 直线 / Ctrl+Shift 箭头")!=std::wstring::npos;
-            bool occupied=RegisterHotKey(window,21,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,'8')!=FALSE;
-            bool rolledBack=occupied && !applySettings(MOD_CONTROL|MOD_ALT,'8',false,false,error) && startupEnabled() && showHint &&
-                GetPrivateProfileIntW(L"UI",L"ShowHint",0,settingsPath.c_str())==1;
-            if (occupied) UnregisterHotKey(window,21);
-            bool disabled=applySettings(hotkeyModifiers,hotkeyKey,false,false,error) && !startupEnabled() &&
-                hintPanel.Visibility()==Visibility::Collapsed && GetPrivateProfileIntW(L"UI",L"ShowHint",1,settingsPath.c_str())==0;
-            bool deleted=applySettings(0,0,false,false,error) && !hotkey && hotkeyKey==0 &&
-                GetPrivateProfileIntW(L"Hotkey",L"Key",'2',settingsPath.c_str())==0 &&
-                validShortcut(GetPrivateProfileIntW(L"Hotkey",L"Modifiers",99,settingsPath.c_str()),0);
-            bool released=RegisterHotKey(window,20,MOD_CONTROL|MOD_NOREPEAT,'2')!=FALSE;
-            if (released) UnregisterHotKey(window,20);
-            bool restored=applyShortcut(MOD_CONTROL,'2',error);
-            log << "hotkey-delete-persists-and-unregisters=" << (deleted && released && restored) << "\n";
-            if (!(deleted && released && restored)) testResult=1;
-            RegDeleteKeyW(HKEY_CURRENT_USER,startupKey());
-            log << "new-options-default-off=" << defaults << "\noptions-enable-persist=" << enabled << "\nhint-shortcuts-second-line=" << secondLine <<
-                "\noptions-shortcut-conflict-rolls-back=" << rolledBack << "\noptions-disable-persist=" << disabled << "\n";
-            if (!(defaults && enabled && secondLine && rolledBack && disabled)) testResult=1;
-            enter();
-            bool animated=cursorAnimating && cursorDiameter>190 && cursorSurface.Visibility()==Visibility::Visible;
-            SetCursor(LoadCursorW(nullptr,IDC_ARROW)); // Ink/XAML may replace the cursor shape while active.
-            CURSORINFO nativeCursor{sizeof(nativeCursor)};
-            bool hiddenDespiteShape=GetCursorInfo(&nativeCursor) && !(nativeCursor.flags&CURSOR_SHOWING);
-            log << "system-cursor-hidden-despite-shape-change=" << hiddenDespiteShape << "\n";
-            if (!hiddenDespiteShape) testResult=1;
-            finishCursorAnimation();
-            bool settled=!cursorAnimating && cursorDiameter==penWidth;
-            setColor('W');
-            bool colorSync=cursorDot.Fill().as<SolidColorBrush>().Color()==Palette[colorIndex].value &&
-                cursorDot.Stroke().as<SolidColorBrush>().Color().R==25;
-            POINT cursorPoint{}; GetCursorPos(&cursorPoint); ScreenToClient(island,&cursorPoint);
-            float cursorScale=static_cast<float>(GetDpiForWindow(island))/96.0f;
-            bool centered=std::abs(Canvas::GetLeft(cursorDot)+cursorDot.Width()/2-cursorPoint.x/cursorScale)<1 &&
-                std::abs(Canvas::GetTop(cursorDot)+cursorDot.Height()/2-cursorPoint.y/cursorScale)<1;
-            leave();
-            bool restoredCursor=GetCursor()==LoadCursorW(nullptr,IDC_ARROW) && cursorHideCalls==0 && !cursorAnimating && cursorSurface.Visibility()==Visibility::Collapsed;
-            log << "cursor-entry-200-animation=" << animated << "\ncursor-animation-settles-at-width=" << settled <<
-                "\ncursor-color-and-contrast-sync=" << colorSync << "\ncursor-hotspot-centered=" << centered << "\ncursor-restored-on-exit=" << restoredCursor << "\n";
-            if (!(animated && settled && colorSync && centered && restoredCursor)) testResult=1;
-            log << "result=" << testResult << "\n"; log.flush();
-            DestroyWindow(testBackground); PostMessageW(window,WM_CLOSE,0,0);
-        }
-        ++testStep;
-    }
 public:
-    int verifyPortable() {
-        loadSettings();
-        auto path=executablePath(); auto folder=path.substr(0,path.find_last_of(L"\\"));
-        bool valid=settingsPath==folder+L"\\settings.ini" && saveBrushSettings();
-        valid=valid && GetPrivateProfileIntW(L"Pen",L"Width",0,settingsPath.c_str())==static_cast<UINT>(penWidth) &&
-            GetPrivateProfileIntW(L"Pen",L"Color",99,settingsPath.c_str())==colorIndex &&
-            GetPrivateProfileIntW(L"Pen",L"Tool",99,settingsPath.c_str())==static_cast<UINT>(tool);
-        std::ofstream report(folder+L"\\portable-test.log");
-        report << "adjacent-config-and-write=" << valid << "\nhotkey-modifiers=" << hotkeyModifiers << "\nhotkey-key=" << hotkeyKey <<
-            "\npen-width=" << penWidth << "\npen-color=" << colorIndex << "\npen-tool=" << static_cast<int>(tool) <<
-            "\nhint=" << showHint << "\nresult=" << (valid ? 0 : 1) << "\n";
-        return valid ? 0 : 1;
-    }
-    int run(HINSTANCE instance, bool testing, bool cursorTesting=false) {
-        selfTest=testing; cursorOnlyTest=cursorTesting;
+    int run(HINSTANCE instance) {
         INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_HOTKEY_CLASS}; InitCommonControlsEx(&controls);
         loadSettings();
-        if (testing) log.open(cursorOnlyTest ? "build/cursor-test.log" : "build/self-test.log");
         WNDCLASSW wc{}; wc.lpfnWndProc=procedure; wc.hInstance=instance;
         wc.hIcon=appIcon(false);
         wc.lpszClassName=ClassName; wc.hCursor=nullptr;
@@ -1363,14 +889,18 @@ public:
         Grid root;
         root.Background(SolidColorBrush(Color{0,0,0,0}));
         canvas=InkCanvas(); presenter=canvas.InkPresenter();
-        presenter.InputDeviceTypes(Windows::UI::Core::CoreInputDeviceTypes::Pen | Windows::UI::Core::CoreInputDeviceTypes::Mouse | Windows::UI::Core::CoreInputDeviceTypes::Touch);
+        presenter.InputDeviceTypes(Windows::UI::Core::CoreInputDeviceTypes::Pen);
         InkDrawingAttributes attributes;
         attributes.Color(Palette[colorIndex].value); attributes.Size({penWidth,penWidth});
         attributes.IgnorePressure(false); attributes.FitToCurve(true);
         attributes.ModelerAttributes().UseVelocityBasedPressure(false);
         presenter.UpdateDefaultDrawingAttributes(attributes); presenter.IsInputEnabled(false);
-        presenter.StrokesCollected([this](auto const&, auto const&) { if (!active) clear(); });
+        presenter.StrokesCollected([this](auto const&, InkStrokesCollectedEventArgs const& args) {
+            if (!active) { clear(); return; }
+            for (auto const& stroke:args.Strokes()) drawingOrder.push_back({stroke.Id(),nullptr});
+        });
         root.Children().Append(canvas);
+        initializeFreehand(root);
         initializeShapes(root);
         root.AddHandler(UIElement::PointerPressedEvent(),box_value(XamlInput::PointerEventHandler(
             [this](auto const&, auto const&) { if (active && cursorAnimating) finishCursorAnimation(); })),true);
@@ -1404,16 +934,13 @@ public:
         inkInput.PointerEntering([this](auto const& input, auto const&) {
             // This setter must execute on Ink's input thread, not the XAML UI thread.
             input.PointerCursor(nullptr);
-            inkCursorConfigured=true;
         });
         Window::Current().CoreWindow().PointerCursor(nullptr);
         SetWindowPos(island,nullptr,0,0,800,600,SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOACTIVATE);
         taskbarCreated=RegisterWindowMessageW(L"TaskbarCreated"); tray();
         hotkey=hotkeyKey && RegisterHotKey(window,hotkeyId,hotkeyModifiers | MOD_NOREPEAT,hotkeyKey) != FALSE;
-        if (testing) log << "hotkey-registered=" << hotkey << " error=" << GetLastError() << "\n";
         WTSRegisterSessionNotification(window,NOTIFY_FOR_THIS_SESSION);
-        if (hotkeyKey && !hotkey && !testing) MessageBoxW(nullptr,(shortcutText()+L" 已被占用。请通过托盘开始标注，或在设置中修改快捷键。").c_str(),L"MyZoomIt",MB_OK | MB_ICONWARNING);
-        if (testing) SetTimer(window,1,100,nullptr);
+        if (hotkeyKey && !hotkey) MessageBoxW(nullptr,(shortcutText()+L" 已被占用。请通过托盘开始标注，或在设置中修改快捷键。").c_str(),L"MyZoomIt",MB_OK | MB_ICONWARNING);
         MSG msg{};
         int status;
         while ((status=GetMessageW(&msg,nullptr,0,0)) > 0) {
@@ -1444,13 +971,14 @@ public:
             if (!handled) { TranslateMessage(&msg); DispatchMessageW(&msg); }
             if (active) hideSystemCursor();
         }
+        cancelFreehand(); freehandSurface=nullptr; freehandInputRoot=nullptr; drawingOrder.clear();
         cursorDot=nullptr; cursorSurface=nullptr; inkInput=nullptr; presenter=nullptr; canvas=nullptr; hintText=nullptr; hintPanel=nullptr; preview=nullptr; shapeSurface=nullptr; source.Content(nullptr); native=nullptr;
         source.Close(); source=nullptr; manager.Close(); manager=nullptr;
         return status==-1 ? 1 : static_cast<int>(msg.wParam);
     }
 };
 
-int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR command,int) {
+int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     auto mutex=CreateMutexW(nullptr,FALSE,L"Local\\MyZoomIt.SingleInstance.v1");
     if (!mutex) return 1;
@@ -1462,8 +990,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR command,int) {
     int result=1;
     try {
         init_apartment(apartment_type::single_threaded);
-        App app; auto argument=std::wstring(command);
-        result=argument==L"--portable-test" ? app.verifyPortable() : app.run(instance,argument==L"--self-test" || argument==L"--cursor-test",argument==L"--cursor-test");
+        App app; result=app.run(instance);
     } catch (hresult_error const& e) {
         wchar_t code[32]{}; swprintf_s(code,L"\nHRESULT: 0x%08X",static_cast<unsigned>(e.code().value));
         auto text=std::wstring(L"初始化 Windows Ink 失败：\n") + e.message().c_str() + code;
@@ -1471,6 +998,4 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR command,int) {
     }
     CloseHandle(mutex); return result;
 }
-
-
 

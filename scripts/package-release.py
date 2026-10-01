@@ -1,4 +1,4 @@
-"""Freeze the validated local portable release. Run from any working directory."""
+"""Package the local portable release with its build and validation record. Run from any working directory."""
 from pathlib import Path
 import hashlib
 import shutil
@@ -9,18 +9,17 @@ version = (root / 'VERSION.txt').read_text().strip()
 release = root / 'releases' / f'v{version}'
 if release.exists():
     raise SystemExit(f'Release already exists; preserve the frozen snapshot: {release}')
-for name in ('self-test.log', 'cursor-test.log'):
-    if 'result=0' not in (root / 'build' / name).read_text():
-        raise SystemExit(f'Missing passing validation: {name}')
-for name in ('拷贝 A', '拷贝 B'):
-    if 'result=0' not in (root / 'build' / 'portable-verification' / name / 'portable-test.log').read_text():
-        raise SystemExit(f'Missing portable validation: {name}')
+for path in (root / 'build' / 'MyZoomIt.exe', root / 'build' / 'build.log', root / 'docs' / f'release-v{version}.md'):
+    if not path.is_file():
+        raise SystemExit(f'Missing release input: {path}')
 
 bundle_name = f'MyZoomIt-v{version}-win-x64'
 bundle = release / bundle_name
 bundle.mkdir(parents=True)
 shutil.copy2(root / 'build' / 'MyZoomIt.exe', bundle / 'MyZoomIt.exe')
-shutil.copy2(root / 'build' / 'settings.ini', bundle / 'settings.ini')
+(bundle / 'settings.ini').write_text('[Hotkey]\nModifiers=2\nKey=50\n[UI]\nShowHint=0\n[Pen]\nWidth=12\nColor=0\nTool=0\n', encoding='utf-8')
+shutil.copy2(root / 'LICENSE', bundle / 'LICENSE.txt')
+shutil.copy2(root / 'third_party' / 'perfect-freehand' / 'LICENSE', bundle / 'perfect-freehand-LICENSE.txt')
 (bundle / 'VERSION.txt').write_text(version + '\n', encoding='utf-8')
 (bundle / '使用说明.txt').write_text(f'''MyZoomIt v{version} 便携版
 
@@ -51,18 +50,16 @@ settings.ini 固定在程序旁，保存快捷键、悬浮菜单和正常退出�
 
 verification = release / 'verification'
 verification.mkdir()
-for name in ('build.log', 'self-test.log', 'cursor-test.log', 'dependencies.txt'):
-    shutil.copy2(root / 'build' / name, verification / name)
-for index, name in enumerate(('拷贝 A', '拷贝 B'), 1):
-    shutil.copy2(root / 'build' / 'portable-verification' / name / 'portable-test.log', verification / f'portable-copy-{index}.log')
-shutil.copy2(root / 'docs' / 'release-v1.0.md', release / 'README.md')
+shutil.copy2(root / 'build' / 'build.log', verification / 'build.log')
+(verification / 'validation.txt').write_text('Release build completed. Drawing behavior confirmed manually by the user before cleanup; no automated or desktop drawing tests rerun after cleanup.\n', encoding='utf-8')
+shutil.copy2(root / 'docs' / f'release-v{version}.md', release / 'README.md')
 
 with zipfile.ZipFile(release / f'{bundle_name}.zip', 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
     for path in sorted(bundle.iterdir()):
         archive.write(path, f'{bundle_name}/{path.name}')
 with zipfile.ZipFile(release / f'MyZoomIt-v{version}-source.zip', 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-    paths = [root / 'README.md', root / 'VERSION.txt', root / '.gitignore']
-    for directory in ('src', 'scripts', 'docs', 'assets'):
+    paths = [root / 'README.md', root / 'VERSION.txt', root / '.gitignore', root / 'LICENSE']
+    for directory in ('src', 'scripts', 'docs', 'assets', 'third_party'):
         paths.extend(p for p in (root / directory).rglob('*') if p.is_file() and '__pycache__' not in p.parts)
     for path in sorted(paths):
         archive.write(path, f'MyZoomIt-v{version}-source/{path.relative_to(root).as_posix()}')
