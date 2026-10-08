@@ -1074,6 +1074,20 @@ class App {
         auto app=reinterpret_cast<App*>(GetWindowLongPtrW(dialog,DWLP_USER));
         if (msg==WM_INITDIALOG) {
             app=reinterpret_cast<App*>(l); SetWindowLongPtrW(dialog,DWLP_USER,l); app->aboutWindow=dialog;
+            auto image=GetDlgItem(dialog,IDC_COFFEE_IMAGE);
+            RECT imageRect{}; GetWindowRect(image,&imageRect);
+            int size=MulDiv(96,static_cast<int>(GetDpiForWindow(dialog)),96);
+            int delta=size-(imageRect.bottom-imageRect.top);
+            SetWindowPos(image,nullptr,0,0,size,size,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+            for (int id:{IDC_COFFEE_CAPTION,IDC_ABOUT_AUTHOR,IDC_ABOUT_GROUP,IDOK}) {
+                auto control=GetDlgItem(dialog,id); RECT rect{}; GetWindowRect(control,&rect);
+                MapWindowPoints(nullptr,dialog,reinterpret_cast<POINT*>(&rect),2);
+                if (id==IDC_ABOUT_GROUP)
+                    SetWindowPos(control,nullptr,0,0,rect.right-rect.left,rect.bottom-rect.top+delta,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+                else SetWindowPos(control,nullptr,rect.left,rect.top+delta,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+            }
+            RECT bounds{}; GetWindowRect(dialog,&bounds);
+            SetWindowPos(dialog,nullptr,0,0,bounds.right-bounds.left,bounds.bottom-bounds.top+delta,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
             SendMessageW(dialog,WM_SETICON,ICON_BIG,reinterpret_cast<LPARAM>(appIcon(false)));
             SendMessageW(dialog,WM_SETICON,ICON_SMALL,reinterpret_cast<LPARAM>(appIcon(true)));
             SetDlgItemTextW(dialog,IDC_ABOUT_TEXT,
@@ -1081,6 +1095,18 @@ class App {
             PostMessageW(dialog,SettingsReadyMessage,0,0); return TRUE;
         }
         if (!app) return FALSE;
+        if (msg==WM_DRAWITEM && w==IDC_COFFEE_IMAGE) {
+            auto item=reinterpret_cast<DRAWITEMSTRUCT*>(l);
+            auto bitmap=static_cast<HBITMAP>(LoadImageW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(IDB_COFFEE),IMAGE_BITMAP,0,0,LR_CREATEDIBSECTION));
+            if (bitmap) {
+                BITMAP info{}; GetObjectW(bitmap,sizeof(info),&info);
+                auto memory=CreateCompatibleDC(item->hDC); auto old=SelectObject(memory,bitmap);
+                int mode=SetStretchBltMode(item->hDC,COLORONCOLOR);
+                StretchBlt(item->hDC,0,0,item->rcItem.right,item->rcItem.bottom,memory,0,0,info.bmWidth,info.bmHeight,SRCCOPY);
+                SetStretchBltMode(item->hDC,mode); SelectObject(memory,old); DeleteDC(memory); DeleteObject(bitmap);
+            }
+            return TRUE;
+        }
         if (msg==SettingsReadyMessage) {
             ShowWindow(dialog,SW_SHOWNORMAL); SetForegroundWindow(dialog); SetFocus(GetDlgItem(dialog,IDOK)); return TRUE;
         }

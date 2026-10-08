@@ -42,17 +42,21 @@ BEGIN
     DEFPUSHBUTTON "保存", IDOK, 148, 334, 56, 20
     PUSHBUTTON "取消", IDCANCEL, 214, 334, 56, 20
 END
-IDD_ABOUT DIALOGEX 0, 0, 264, 156
+IDD_ABOUT DIALOGEX 0, 0, 264, 242
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "关于 myZoomit"
 FONT 9, "Segoe UI"
 BEGIN
-    GROUPBOX "关于", -1, 10, 8, 244, 114
+    GROUPBOX "关于", IDC_ABOUT_GROUP, 10, 8, 244, 200
     LTEXT "", IDC_ABOUT_TEXT, 20, 20, 224, 24, SS_NOPREFIX
     CONTROL "项目：<a href=""https://github.com/Algustav/myZoomit"">https://github.com/Algustav/myZoomit</a>", IDC_PROJECT_LINK, "SysLink", WS_TABSTOP, 20, 52, 224, 12
     CONTROL "联系：<a href=""mailto:mail@ganlei.com"">mail@ganlei.com</a>", IDC_CONTACT_LINK, "SysLink", WS_TABSTOP, 20, 64, 224, 12
     LTEXT "语言：C++     协议：MIT", -1, 20, 76, 224, 12
     CONTROL "致谢：<a href=""https://github.com/steveruizok/perfect-freehand"">https://github.com/steveruizok/perfect-freehand</a>", IDC_CREDITS_LINK, "SysLink", WS_TABSTOP, 20, 92, 224, 12
-    LTEXT "by 甘磊 & codex 2026", -1, 20, 108, 224, 12, SS_NOPREFIX
-    DEFPUSHBUTTON "关闭", IDOK, 198, 130, 56, 18
+    CONTROL "", IDC_COFFEE_IMAGE, "STATIC", SS_OWNERDRAW, 20, 108, 56, 64
+    LTEXT "请我喝杯生椰拿铁", IDC_COFFEE_CAPTION, 20, 176, 224, 12
+    LTEXT "by 甘磊 & codex 2026", IDC_ABOUT_AUTHOR, 20, 192, 224, 12, SS_NOPREFIX
+    DEFPUSHBUTTON "关闭", IDOK, 198, 216, 56, 18
 END
+
+IDB_COFFEE BITMAP "../assets/acoffee.bmp"
