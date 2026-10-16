@@ -1,1 +1,0 @@
-Release build completed. Updated About image and caption; no functional or UI tests performed.

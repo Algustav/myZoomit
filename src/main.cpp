@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <shellapi.h>
@@ -20,6 +20,10 @@
 #include <winrt/Windows.UI.Input.Inking.h>
 #include <winrt/Windows.UI.Input.Inking.Core.h>
 #include <cmath>
+
+#include <winrt/Windows.UI.Xaml.Media.Imaging.h>
+#include <cstring>
+#include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
@@ -32,6 +36,10 @@
 #include <array>
 #include <vector>
 #include <memory>
+#include <windowsx.h>
+#include <stdexcept>
+#include "timer_window.h"
+#include "settings_tabs.h"
 
 using namespace winrt;
 using namespace Windows::UI;
@@ -68,7 +76,131 @@ IXamlSourceTransparency : ::IInspectable {
     virtual HRESULT STDMETHODCALLTYPE put_IsBackgroundTransparent(boolean value) = 0;
 };
 
+MIDL_INTERFACE("905a0fef-bc53-11df-8c49-001e4fc686da")
+PixelBufferAccess : ::IUnknown { virtual HRESULT STDMETHODCALLTYPE Buffer(BYTE** value)=0; };
+
 class App {
+    TimerWindow timer;
+    bool timerHotkey{};
+    int settingsPage{};
+    void timerSettings(HWND =nullptr) { settings(2); }
+
+    bool snapshotMode{}, browsing{};
+    UINT snapshotMods{MOD_CONTROL}, snapshotKey{'1'};
+    bool snapshotHotkey{};
+    int initialZoom{200}, defaultPenWidth{8}, zoomWheelRemainder{};
+    double zoom{1}, viewX{}, viewY{}, sceneWidth{}, sceneHeight{};
+    Grid scene{nullptr};
+    Image screenshot{nullptr};
+    CompositeTransform viewTransform{nullptr};
+    Grid viewport{nullptr};
+    Grid activationSurface{nullptr};
+    std::vector<uint32_t> activationPointers;
+    void resetActivationSurface(bool visible) {
+        activationPointers.clear();
+        activationSurface.ReleasePointerCaptures();
+        activationSurface.Visibility(visible ? Visibility::Visible : Visibility::Collapsed);
+    }
+    void releaseActivationPointer(uint32_t id) {
+        std::erase(activationPointers,id);
+        if (activationPointers.empty() && !browsing)
+            activationSurface.Visibility(Visibility::Collapsed);
+    }
+    static constexpr UINT_PTR ZoomTimer=3;
+    bool zoomAnimating{};
+    ULONGLONG zoomStarted{};
+    double zoomTarget{1}, zoomAnchorX{}, zoomAnchorY{};
+    void stopZoomAnimation() {
+        zoomAnimating=false; KillTimer(window,ZoomTimer);
+    }
+    void animateZoom() {
+        if (!active || !snapshotMode || !zoomAnimating) return;
+        double t=std::min(1.0,(GetTickCount64()-zoomStarted)/180.0);
+        double eased=t*t*(3-2*t);
+        zoom=1+(zoomTarget-1)*eased;
+        viewX=zoomAnchorX*(1-1/zoom); viewY=zoomAnchorY*(1-1/zoom);
+        updateView();
+        if (t>=1) { stopZoomAnimation(); updateHint(); }
+    }
+    static HBITMAP captureScreen(RECT r) {
+        auto dc=GetDC(nullptr); if (!dc) return nullptr;
+        auto memory=CreateCompatibleDC(dc);
+        auto bitmap=CreateCompatibleBitmap(dc,r.right-r.left,r.bottom-r.top);
+        if (!memory || !bitmap) { if (memory) DeleteDC(memory); if (bitmap) DeleteObject(bitmap); ReleaseDC(nullptr,dc); return nullptr; }
+        auto old=SelectObject(memory,bitmap);
+        BOOL ok=BitBlt(memory,0,0,r.right-r.left,r.bottom-r.top,dc,r.left,r.top,SRCCOPY|CAPTUREBLT);
+        SelectObject(memory,old); DeleteDC(memory); ReleaseDC(nullptr,dc);
+        if (!ok) { DeleteObject(bitmap); return nullptr; }
+        return bitmap;
+    }
+    void copyFinalScreen() {
+        // Capture the final visible viewport before hiding or clearing the overlay.
+        DwmFlush();
+        RECT r{}; GetWindowRect(window,&r); auto bitmap=captureScreen(r);
+        if (!bitmap) return;
+        bool copied=false;
+        for (int attempt=0;attempt<5;++attempt) {
+            if (OpenClipboard(window)) {
+                if (EmptyClipboard()) copied=SetClipboardData(CF_BITMAP,bitmap)!=nullptr;
+                CloseClipboard(); break;
+            }
+            Sleep(10);
+        }
+        if (!copied) { DeleteObject(bitmap); OutputDebugStringW(L"MyZoomIt: clipboard copy failed\n"); }
+    }
+    void updateView() {
+        viewX=std::clamp(viewX,0.0,std::max(0.0,sceneWidth-sceneWidth/zoom));
+        viewY=std::clamp(viewY,0.0,std::max(0.0,sceneHeight-sceneHeight/zoom));
+        viewTransform.ScaleX(zoom); viewTransform.ScaleY(zoom);
+        viewTransform.TranslateX(-viewX*zoom); viewTransform.TranslateY(-viewY*zoom);
+    }
+    POINT browsePointer{};
+    void browseMove(bool reset=false) {
+        POINT p{}; GetCursorPos(&p); ScreenToClient(island,&p);
+        if (!reset && p.x==browsePointer.x && p.y==browsePointer.y) return;
+        double dpi=GetDpiForWindow(island)/96.0;
+        if (!reset && zoomAnimating) {
+            zoomAnchorX=p.x/dpi; zoomAnchorY=p.y/dpi;
+            browsePointer=p; animateZoom(); return;
+        }
+        stopZoomAnimation();
+        if (reset) { viewX=p.x/dpi*(1-1/zoom); viewY=p.y/dpi*(1-1/zoom); }
+        else { viewX+=(p.x-browsePointer.x)/dpi*(1-1/zoom); viewY+=(p.y-browsePointer.y)/dpi*(1-1/zoom); }
+        browsePointer=p;
+        updateView();
+    }
+    void browseWheel(int delta) {
+        zoomWheelRemainder+=delta;
+        int steps=zoomWheelRemainder/WHEEL_DELTA;
+        zoomWheelRemainder%=WHEEL_DELTA;
+        if (!steps) return;
+        if (zoomAnimating) {
+            zoom=zoomTarget; viewX=zoomAnchorX*(1-1/zoom); viewY=zoomAnchorY*(1-1/zoom);
+        }
+        stopZoomAnimation();
+        POINT p{}; GetCursorPos(&p); ScreenToClient(island,&p);
+        double dpi=GetDpiForWindow(island)/96.0, x=p.x/dpi, y=p.y/dpi;
+        double next=std::clamp(std::round(zoom*4)/4+steps*0.25,1.0,8.0);
+        viewX+=x/zoom-x/next; viewY+=y/zoom-y/next; zoom=next;
+        if (zoom==1) viewX=viewY=0;
+        browsePointer=p; updateView(); updateHint();
+    }
+    void returnToBrowse() {
+        cancelFreehand(); cancelShape(); finishErase();
+        GetCursorPos(&browsePointer); ScreenToClient(island,&browsePointer);
+        browsing=true; cursorAnimating=false; KillTimer(window,CursorTimer);
+        resetActivationSurface(true);
+        Window::Current().CoreWindow().PointerCursor(Windows::UI::Core::CoreCursor(Windows::UI::Core::CoreCursorType::Arrow,0));
+        cursorSurface.Visibility(Visibility::Collapsed); restoreSystemCursor(); updateHint();
+    }
+    void beginAnnotation() {
+        if (!active || !snapshotMode || !browsing) return;
+        stopZoomAnimation();
+        browsing=false;
+        Window::Current().CoreWindow().PointerCursor(nullptr);
+        updateHint(); hideSystemCursor(); finishCursorAnimation();
+        SetTimer(window,CursorTimer,16,nullptr);
+    }
     HWND window{};
     HWND island{};
     HWND previous{};
@@ -94,10 +226,26 @@ class App {
     Windows::Foundation::Point shapeStart{}, shapeEnd{};
     InkDrawingAttributes shapeAttributes{nullptr};
     bool drawingFreehand{};
-    bool eraserMode{}, erasing{};
+    bool eraserMode{}, erasing{}, penTipEraser{};
     uint32_t eraserPointer{};
     Windows::Foundation::Point eraserPosition{}, eraserPrevious{};
     bool cursorTouch{};
+    bool cursorSuppressedByContact{};
+    POINT contactCursorPosition{};
+    void observeCursorInput(Windows::Devices::Input::PointerDeviceType device, bool contact) {
+        if (!active) return;
+        if (device!=Windows::Devices::Input::PointerDeviceType::Mouse) {
+            if (!contact) return;
+            cursorSuppressedByContact=true; cursorAnimating=false;
+            GetCursorPos(&contactCursorPosition);
+            if (cursorSurface) cursorSurface.Visibility(Visibility::Collapsed);
+        } else if (cursorSuppressedByContact) {
+            POINT point{}; GetCursorPos(&point);
+            if (point.x==contactCursorPosition.x && point.y==contactCursorPosition.y) return;
+            cursorSuppressedByContact=false; cursorTouch=false;
+            refreshCursor(penWidth);
+        }
+    }
     static constexpr float EraserDiameter=12;
     uint32_t freehandPointer{};
     Windows::Devices::Input::PointerDeviceType freehandDevice{Windows::Devices::Input::PointerDeviceType::Mouse};
@@ -133,6 +281,15 @@ class App {
     }
     void rememberInk(InkStroke const& stroke) {
         UndoItem item; item.inkId=stroke.Id(); item.inkSnapshot=stroke.Clone(); item.sequence=++nextSequence;
+        // Each completed Ink stroke keeps its native rendering and pressure, but
+        // lives alongside mouse/touch strokes in the same chronological layer.
+        item.freehandStroke=Canvas(); item.freehandStroke.IsHitTestVisible(false);
+        InkCanvas display; display.IsHitTestVisible(false);
+        display.Width(canvas.ActualWidth()); display.Height(canvas.ActualHeight());
+        display.InkPresenter().InputDeviceTypes(Windows::UI::Core::CoreInputDeviceTypes::None);
+        display.InkPresenter().StrokeContainer().AddStroke(stroke.Clone());
+        item.freehandStroke.Children().Append(display);
+        freehandSurface.Children().Append(item.freehandStroke);
         drawingOrder.push_back(item); recordEdit({true,{item}});
     }
     void removeItem(UndoItem const& item) {
@@ -146,35 +303,18 @@ class App {
         }
     }
     void applyEdit(Edit const& edit, bool restore) {
-        bool restoreInk=false;
         for (auto const& saved:edit.items) {
             if (!restore) {
                 auto found=std::find_if(drawingOrder.begin(),drawingOrder.end(),[&](auto const& item) { return item.sequence==saved.sequence; });
                 if (found!=drawingOrder.end()) { removeItem(*found); drawingOrder.erase(found); }
             } else {
                 auto item=saved;
-                if (item.freehandStroke) {
-                    uint32_t index=0;
-                    for (auto const& existing:drawingOrder)
-                        if (existing.freehandStroke && existing.sequence<item.sequence) ++index;
-                    freehandSurface.Children().InsertAt(index,item.freehandStroke);
-                } else {
-                    restoreInk=true;
-                }
+                uint32_t index=0;
+                for (auto const& existing:drawingOrder) if (existing.sequence<item.sequence) ++index;
+                freehandSurface.Children().InsertAt(index,item.freehandStroke);
                 auto at=std::lower_bound(drawingOrder.begin(),drawingOrder.end(),item.sequence,
                     [](auto const& existing,uint64_t sequence) { return existing.sequence<sequence; });
                 drawingOrder.insert(at,item);
-            }
-        }
-        if (restoreInk) {
-            // Clone first: a stroke cannot belong to two containers. Reinsert native
-            // strokes in their original drawing order after restoring an earlier one.
-            std::vector<InkStroke> prepared;
-            for (auto const& item:drawingOrder) if (item.inkSnapshot) prepared.push_back(item.inkSnapshot.Clone());
-            auto container=presenter.StrokeContainer(); container.Clear();
-            size_t index=0;
-            for (auto& item:drawingOrder) if (item.inkSnapshot) {
-                auto stroke=prepared[index++]; stroke.Selected(false); container.AddStroke(stroke); item.inkId=stroke.Id();
             }
         }
     }
@@ -221,15 +361,18 @@ class App {
     }
     void finishErase() {
         if (!erasing) return;
-        erasing=false; recordEdit({false,std::move(erasedItems)}); erasedItems.clear();
+        erasing=false; penTipEraser=false; recordEdit({false,std::move(erasedItems)}); erasedItems.clear();
         if (freehandInputRoot) freehandInputRoot.ReleasePointerCaptures();
         refreshCursor(penWidth);
     }
     void toggleEraser() {
         cancelFreehand(); finishErase();
         if (tool!=Tool::Pen) setTool(Tool::Pen);
-        eraserMode=!eraserMode; cursorAnimating=false; cursorTouch=false;
-        refreshCursor(penWidth); updateHint();
+        eraserMode=!eraserMode; cursorTouch=false;
+        cursorAnimationStart=(eraserMode ? 48.0f : 24.0f)/static_cast<float>(snapshotMode ? zoom : 1.0);
+        cursorStarted=GetTickCount64(); cursorAnimating=true;
+        SetTimer(window,CursorTimer,16,nullptr);
+        animateCursor(); updateHint();
     }
 
     void cancelFreehand() {
@@ -480,6 +623,7 @@ class App {
             auto stroke=builder.CreateStroke(points);
             presenter.StrokeContainer().AddStroke(stroke);
             rememberInk(stroke);
+            presenter.StrokeContainer().Clear();
         }
         cancelShape();
         if (tool!=requestedTool) setTool(requestedTool);
@@ -536,6 +680,7 @@ class App {
     Windows::UI::Xaml::Shapes::Ellipse cursorRing{nullptr};
     ULONGLONG cursorStarted{};
     bool cursorAnimating{};
+    float cursorAnimationStart{200};
     unsigned cursorHideCalls{};
     void hideSystemCursor() {
         // Read the thread's display count without changing it, then retain only our hides.
@@ -550,24 +695,32 @@ class App {
     }
     static constexpr UINT_PTR CursorTimer=2;
     void positionCursor() {
-        if (!active || !cursorDot) return;
+        if (!active || !cursorDot || browsing) return;
         POINT point{}; GetCursorPos(&point); ScreenToClient(island,&point);
         float scale=static_cast<float>(GetDpiForWindow(island))/96.0f;
-        float x=eraserMode && cursorTouch ? eraserPosition.X : point.x/scale;
-        float y=eraserMode && cursorTouch ? eraserPosition.Y : point.y/scale;
+        float x=(penTipEraser || (eraserMode && cursorTouch)) ? eraserPosition.X : point.x/scale;
+        if (snapshotMode && !penTipEraser && !(eraserMode && cursorTouch)) x=static_cast<float>(x/zoom+viewX);
+        float y=(penTipEraser || (eraserMode && cursorTouch)) ? eraserPosition.Y : point.y/scale;
+        if (snapshotMode && !penTipEraser && !(eraserMode && cursorTouch)) y=static_cast<float>(y/zoom+viewY);
         Canvas::SetLeft(cursorDot,x-static_cast<float>(cursorDot.Width())/2);
         Canvas::SetTop(cursorDot,y-static_cast<float>(cursorDot.Height())/2);
         if (cursorRing) {
-            Canvas::SetLeft(cursorRing,x-EraserDiameter/2); Canvas::SetTop(cursorRing,y-EraserDiameter/2);
+            Canvas::SetLeft(cursorRing,x-static_cast<float>(cursorRing.Width())/2);
+            Canvas::SetTop(cursorRing,y-static_cast<float>(cursorRing.Height())/2);
         }
     }
     void refreshCursor(float diameter, float opacity=1.0f) {
         if (!cursorDot) return;
-        if (eraserMode) {
+        if (cursorSuppressedByContact || browsing) {
+            cursorSurface.Visibility(Visibility::Collapsed); return;
+        }
+        if (eraserMode || penTipEraser) {
+            float size=cursorAnimating && eraserMode && !penTipEraser ? diameter : EraserDiameter;
+            cursorRing.Width(size); cursorRing.Height(size);
             cursorDot.Fill(nullptr); cursorDot.Stroke(SolidColorBrush(Color{255,255,255,255})); cursorDot.StrokeThickness(1);
-            cursorDot.Width(EraserDiameter-2); cursorDot.Height(EraserDiameter-2); cursorDot.Opacity(1);
+            cursorDot.Width(size-2); cursorDot.Height(size-2); cursorDot.Opacity(1);
             cursorRing.Visibility(Visibility::Visible);
-            cursorSurface.Visibility(active && (!cursorTouch || erasing) ? Visibility::Visible : Visibility::Collapsed);
+            cursorSurface.Visibility(active && (!cursorTouch || erasing || cursorAnimating || penTipEraser) ? Visibility::Visible : Visibility::Collapsed);
             positionCursor(); return;
         }
         if (cursorRing) cursorRing.Visibility(Visibility::Collapsed);
@@ -591,7 +744,8 @@ class App {
         if (cursorAnimating) {
             float progress=std::min(1.0f,static_cast<float>(GetTickCount64()-cursorStarted)/180.0f);
             float remaining=1-progress;
-            refreshCursor(penWidth+(200-penWidth)*remaining*remaining*remaining,0.25f+0.75f*progress);
+            float target=eraserMode ? EraserDiameter : penWidth;
+            refreshCursor(target+(cursorAnimationStart-target)*remaining*remaining*remaining,0.25f+0.75f*progress);
             if (progress>=1) cursorAnimating=false;
         } else positionCursor();
     }
@@ -599,10 +753,10 @@ class App {
     HWND aboutWindow{};
     inline static HWND hotkeyEdit{};
     static LRESULT CALLBACK hotkeyMessageProcedure(int code, WPARAM w, LPARAM l) {
-        if (code>=0 && w==PM_REMOVE && hotkeyEdit && GetFocus()==hotkeyEdit) {
+        if (code>=0 && w==PM_REMOVE && hotkeyEdit && (GetFocus()==hotkeyEdit || GetDlgCtrlID(GetFocus())==IDC_SNAPSHOT_HOTKEY || GetDlgCtrlID(GetFocus())==IDC_TIMER_HOTKEY)) {
             auto msg=reinterpret_cast<MSG*>(l);
             // DialogBox handles Alt as menu navigation before dispatch. Give the editor normal key messages.
-            if (msg->hwnd==hotkeyEdit) {
+            if (msg->hwnd==GetFocus()) {
                 if (msg->message==WM_SYSKEYDOWN) msg->message=WM_KEYDOWN;
                 else if (msg->message==WM_SYSKEYUP) msg->message=WM_KEYUP;
                 else if (msg->message==WM_SYSCHAR) msg->message=WM_CHAR;
@@ -706,10 +860,15 @@ class App {
         auto mods=GetPrivateProfileIntW(L"Hotkey",L"Modifiers",MOD_CONTROL,settingsPath.c_str());
         auto code=GetPrivateProfileIntW(L"Hotkey",L"Key",'2',settingsPath.c_str());
         if (validShortcut(mods,code)) { hotkeyModifiers=mods; hotkeyKey=code; }
+        auto sm=GetPrivateProfileIntW(L"Snapshot",L"Modifiers",MOD_CONTROL,settingsPath.c_str());
+        auto sk=GetPrivateProfileIntW(L"Snapshot",L"Key",'1',settingsPath.c_str());
+        if (validShortcut(sm,sk)) { snapshotMods=sm; snapshotKey=sk; }
+        initialZoom=100+25*std::clamp((static_cast<int>(GetPrivateProfileIntW(L"Snapshot",L"Zoom",200,settingsPath.c_str()))-100+12)/25,0,12);
         showHint=GetPrivateProfileIntW(L"UI",L"ShowHint",0,settingsPath.c_str())!=0;
         runAtStartup=startupEnabled();
-        auto savedWidth=GetPrivateProfileIntW(L"Pen",L"Width",12,settingsPath.c_str());
-        penWidth=static_cast<float>(std::clamp(savedWidth,6u,24u));
+        auto savedDefault=GetPrivateProfileIntW(L"Pen",L"DefaultWidth",8,settingsPath.c_str());
+        defaultPenWidth=4+2*std::clamp((static_cast<int>(savedDefault)-4+1)/2,0,10);
+        penWidth=static_cast<float>(defaultPenWidth);
         auto savedColor=GetPrivateProfileIntW(L"Pen",L"Color",0,settingsPath.c_str());
         if (savedColor<Palette.size()) colorIndex=savedColor;
         auto savedTool=GetPrivateProfileIntW(L"Pen",L"Tool",0,settingsPath.c_str());
@@ -717,7 +876,7 @@ class App {
     }
     bool saveBrushSettings() {
         auto section=L"Width="+std::to_wstring(static_cast<int>(penWidth))+L'\0'+
-            L"Color="+std::to_wstring(colorIndex)+L'\0'+L"Tool="+std::to_wstring(static_cast<int>(tool))+L'\0';
+            L"DefaultWidth="+std::to_wstring(defaultPenWidth)+L'\0'+L"Color="+std::to_wstring(colorIndex)+L'\0'+L"Tool="+std::to_wstring(static_cast<int>(tool))+L'\0';
         return WritePrivateProfileSectionW(L"Pen",section.c_str(),settingsPath.c_str())!=FALSE;
     }
     bool applyShortcut(UINT mods, UINT code, std::wstring& error) {
@@ -761,11 +920,19 @@ class App {
                 if (flags & HOTKEYF_EXT) scan|=1<<24;
                 GetKeyNameTextW(scan,name,64); append(name);
             }
+            if (GetFocus()==control) {
+                if (!key) text=L"请按 Ctrl / Alt 组合键…";
+                RECT focus=area;InflateRect(&focus,-3,-3);DrawFocusRect(dc,&focus);
+                SetTextColor(dc,GetSysColor(COLOR_HIGHLIGHT));
+            }
             DrawTextW(dc,text.c_str(),static_cast<int>(text.size()),&area,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
             SelectObject(dc,font); EndPaint(control,&paint); return 0;
         }
         if (msg==WM_SETFOCUS) {
             auto result=DefSubclassProc(control,msg,w,l); HideCaret(control); InvalidateRect(control,nullptr,TRUE); return result;
+        }
+        if (msg==WM_KILLFOCUS) {
+            auto result=DefSubclassProc(control,msg,w,l);InvalidateRect(control,nullptr,TRUE);return result;
         }
         if (msg==HKM_SETHOTKEY) {
             auto result=DefSubclassProc(control,msg,w,l); InvalidateRect(control,nullptr,TRUE); return result;
@@ -786,7 +953,8 @@ class App {
             bool modifier=w==VK_CONTROL || w==VK_LCONTROL || w==VK_RCONTROL || w==VK_SHIFT ||
                 w==VK_LSHIFT || w==VK_RSHIFT || w==VK_MENU || w==VK_LMENU || w==VK_RMENU;
             // Modifier-only events (including synthetic Ctrl around Alt release) must not erase a captured key.
-            if (modifier) return 0;
+            if (w==VK_BACK || w==VK_DELETE) { SendMessageW(control,HKM_SETHOTKEY,0,0);return 0; }
+            if (modifier || !(flags&(HOTKEYF_CONTROL|HOTKEYF_ALT)) || w==VK_F12 || w==VK_LWIN || w==VK_RWIN) return 0;
             if (l & (1LL<<24)) flags|=HOTKEYF_EXT;
             SendMessageW(control,HKM_SETHOTKEY,MAKEWORD(static_cast<BYTE>(w),flags),0);
             return 0;
@@ -794,26 +962,11 @@ class App {
         if (msg==WM_KEYUP || msg==WM_SYSKEYUP || msg==WM_CHAR || msg==WM_SYSCHAR) return 0;
         return DefSubclassProc(control,msg,w,l);
     }
-    static void fitSettings(HWND dialog) {
-        auto label=GetDlgItem(dialog,IDC_INSTRUCTIONS);
-        RECT area{}; GetClientRect(label,&area);
-        int length=GetWindowTextLengthW(label);
-        std::wstring text(static_cast<size_t>(length)+1,L'\0'); GetWindowTextW(label,text.data(),length+1);
-        auto dc=GetDC(label); auto old=SelectObject(dc,reinterpret_cast<HFONT>(SendMessageW(label,WM_GETFONT,0,0)));
-        RECT measured{0,0,area.right,0};
-        DrawTextW(dc,text.c_str(),length,&measured,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);
-        SelectObject(dc,old); ReleaseDC(label,dc);
-        int delta=measured.bottom-area.bottom;
-        SetWindowPos(label,nullptr,0,0,area.right,measured.bottom,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
-        for (int id:{IDC_INSTRUCTION_GROUP,IDC_SHOW_HINT,IDC_STARTUP,IDC_MOUSE_EMPHASIS,IDOK,IDCANCEL}) {
-            auto control=GetDlgItem(dialog,id); RECT r{}; GetWindowRect(control,&r);
-            MapWindowPoints(nullptr,dialog,reinterpret_cast<POINT*>(&r),2);
-            if (id==IDC_INSTRUCTION_GROUP)
-                SetWindowPos(control,nullptr,0,0,r.right-r.left,r.bottom-r.top+delta,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
-            else SetWindowPos(control,nullptr,r.left,r.top+delta,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
-        }
-        RECT bounds{}; GetWindowRect(dialog,&bounds);
-        SetWindowPos(dialog,nullptr,0,0,bounds.right-bounds.left,bounds.bottom-bounds.top+delta,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+    static void updateSliderLabels(HWND dialog) {
+        auto zoomValue=100+25*static_cast<int>(SendDlgItemMessageW(dialog,IDC_SNAPSHOT_ZOOM,TBM_GETPOS,0,0));
+        auto widthValue=4+2*static_cast<int>(SendDlgItemMessageW(dialog,IDC_DEFAULT_WIDTH,TBM_GETPOS,0,0));
+        SetDlgItemTextW(dialog,IDC_SNAPSHOT_ZOOM_VALUE,(std::to_wstring(zoomValue)+L"%").c_str());
+        SetDlgItemTextW(dialog,IDC_DEFAULT_WIDTH_VALUE,(std::to_wstring(widthValue)+L" px").c_str());
     }
     static INT_PTR CALLBACK settingsProcedure(HWND dialog, UINT msg, WPARAM w, LPARAM l) {
         auto app=reinterpret_cast<App*>(GetWindowLongPtrW(dialog,DWLP_USER));
@@ -821,28 +974,34 @@ class App {
             SendMessageW(dialog,WM_SETICON,ICON_BIG,reinterpret_cast<LPARAM>(appIcon(false)));
             SendMessageW(dialog,WM_SETICON,ICON_SMALL,reinterpret_cast<LPARAM>(appIcon(true)));
             app=reinterpret_cast<App*>(l); SetWindowLongPtrW(dialog,DWLP_USER,l); app->settingsWindow=dialog;
+            auto themeLibrary=LoadLibraryW(L"uxtheme.dll");
+            if (themeLibrary) {
+                using SetTheme=HRESULT(WINAPI*)(HWND,LPCWSTR,LPCWSTR);
+                auto setTheme=reinterpret_cast<SetTheme>(GetProcAddress(themeLibrary,"SetWindowTheme"));
+                if (setTheme) setTheme(GetDlgItem(dialog,IDC_SETTINGS_TABS),L"",L"");
+                FreeLibrary(themeLibrary);
+            }
+            SetDlgItemTextW(dialog,IDC_ABOUT_TEXT,L"myZoomit - " MYZOOMIT_VERSION_W L"\r\n轻量屏幕标注工具");
+            int coffeeSize=MulDiv(96,static_cast<int>(GetDpiForWindow(dialog)),96);
+            SetWindowPos(GetDlgItem(dialog,IDC_COFFEE_IMAGE),nullptr,0,0,coffeeSize,coffeeSize,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
             hotkeyEdit=GetDlgItem(dialog,IDC_HOTKEY);
-            SetDlgItemTextW(dialog,IDC_INSTRUCTIONS,
-                L"- 按下快捷键进行标注，再次按下或Esc退出\r\n"
-                L"- 用鼠标、触控笔或触摸屏幕绘制，均支持压感效果\r\n"
-                L"\r\n"
-                L"- 按键1~5切换标注的图形模式：\r\n"
-                L"  1手写，2矩形，3椭圆，4直线，5箭头\r\n"
-                L"- 亦可配合修饰键快速绘制图形：\r\n"
-                L"  Ctrl矩形，Tab椭圆，Shift直线，Ctrl+Shift箭头\r\n"
-                L"- 按键切换笔迹颜色，共七种：\r\n"
-                L"  R红色，G绿色，B蓝色，O橙色，Y黄色，P紫色，W白色\r\n"
-                L"\r\n"
-                L"- Ctrl+滚轮：调整笔迹粗细(6~24px，默认12px)\r\n"
-                L"- Ctrl+Z：撤销上一笔画或图形\r\n"
-                L"- Ctrl+Y：恢复撤销的操作\r\n"
-                L"\r\n"
-                L"- K：切换为纯黑背景，可模拟在黑板上书写\r\n"
-                L"- E：橡皮擦\r\n"
-                L"- C：清空笔迹\r\n"
-                L"\r\n"
-                L"- 退出标注状态会清空笔迹，如需要请按PrtScr键截屏保存");
-            fitSettings(dialog);
+            for (auto name:{L"缩放",L"标注",L"倒计时",L"关于"}) {
+                TCITEMW item{};item.mask=TCIF_TEXT;item.pszText=const_cast<wchar_t*>(name);
+                TabCtrl_InsertItem(GetDlgItem(dialog,IDC_SETTINGS_TABS),TabCtrl_GetItemCount(GetDlgItem(dialog,IDC_SETTINGS_TABS)),&item);
+            }
+            TabCtrl_SetCurSel(GetDlgItem(dialog,IDC_SETTINGS_TABS),app->settingsPage);
+            selectSettingsTab(dialog,app->settingsPage);
+            BYTE timerFlags=0;
+            if (app->timer.modifiers&MOD_CONTROL) timerFlags|=HOTKEYF_CONTROL;
+            if (app->timer.modifiers&MOD_ALT) timerFlags|=HOTKEYF_ALT;
+            if (app->timer.modifiers&MOD_SHIFT) timerFlags|=HOTKEYF_SHIFT;
+            SendDlgItemMessageW(dialog,IDC_TIMER_HOTKEY,HKM_SETHOTKEY,MAKEWORD(app->timer.key,timerFlags),0);
+            SetWindowSubclass(GetDlgItem(dialog,IDC_TIMER_HOTKEY),hotkeyProcedure,1,0);
+            SetDlgItemInt(dialog,IDC_TIMER_MINUTES,app->timer.minutes,FALSE);
+            for (auto name:{L"环形倒计时",L"条形倒计时"}) SendDlgItemMessageW(dialog,IDC_TIMER_STYLE,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(name));
+            SendDlgItemMessageW(dialog,IDC_TIMER_STYLE,CB_SETCURSEL,app->timer.style,0);
+            for (auto name:{L"全屏",L"透明浮窗"}) SendDlgItemMessageW(dialog,IDC_TIMER_SHAPE,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(name));
+            SendDlgItemMessageW(dialog,IDC_TIMER_SHAPE,CB_SETCURSEL,app->timer.defaultFull ? 0 : 1,0);
             app->runAtStartup=app->startupEnabled();
             CheckDlgButton(dialog,IDC_SHOW_HINT,app->showHint ? BST_CHECKED : BST_UNCHECKED);
             CheckDlgButton(dialog,IDC_STARTUP,app->runAtStartup ? BST_CHECKED : BST_UNCHECKED);
@@ -860,24 +1019,44 @@ class App {
             SendDlgItemMessageW(dialog,IDC_HOTKEY,HKM_SETHOTKEY,MAKEWORD(app->hotkeyKey,flags),0);
             SendDlgItemMessageW(dialog,IDC_HOTKEY,HKM_SETRULES,0,0);
             SetWindowSubclass(GetDlgItem(dialog,IDC_HOTKEY),hotkeyProcedure,1,0);
+            BYTE snapshotFlags=0;
+            if (app->snapshotMods & MOD_CONTROL) snapshotFlags|=HOTKEYF_CONTROL;
+            if (app->snapshotMods & MOD_ALT) snapshotFlags|=HOTKEYF_ALT;
+            if (app->snapshotMods & MOD_SHIFT) snapshotFlags|=HOTKEYF_SHIFT;
+            SendDlgItemMessageW(dialog,IDC_SNAPSHOT_HOTKEY,HKM_SETHOTKEY,MAKEWORD(app->snapshotKey,snapshotFlags),0);
+            SetWindowSubclass(GetDlgItem(dialog,IDC_SNAPSHOT_HOTKEY),hotkeyProcedure,1,0);
+            SendDlgItemMessageW(dialog,IDC_SNAPSHOT_ZOOM,TBM_SETRANGE,TRUE,MAKELPARAM(0,12));
+            SendDlgItemMessageW(dialog,IDC_DEFAULT_WIDTH,TBM_SETRANGE,TRUE,MAKELPARAM(0,10));
+            for (int id:{IDC_SNAPSHOT_ZOOM,IDC_DEFAULT_WIDTH}) {
+                SendDlgItemMessageW(dialog,id,TBM_SETPAGESIZE,0,1);
+                SendDlgItemMessageW(dialog,id,TBM_SETTICFREQ,1,0);
+            }
+            SendDlgItemMessageW(dialog,IDC_SNAPSHOT_ZOOM,TBM_SETPOS,TRUE,(app->initialZoom-100)/25);
+            SendDlgItemMessageW(dialog,IDC_DEFAULT_WIDTH,TBM_SETPOS,TRUE,(app->defaultPenWidth-4)/2);
+            updateSliderLabels(dialog);
             PostMessageW(dialog,SettingsReadyMessage,0,0);
             return TRUE;
         }
         if (!app) return FALSE;
+        if (aboutContentProcedure(dialog,msg,w,l)) return TRUE;
+        if (msg==WM_NOTIFY && reinterpret_cast<NMHDR*>(l)->idFrom==IDC_SETTINGS_TABS && reinterpret_cast<NMHDR*>(l)->code==TCN_SELCHANGE) {
+            app->settingsPage=TabCtrl_GetCurSel(GetDlgItem(dialog,IDC_SETTINGS_TABS));
+            selectSettingsTab(dialog,app->settingsPage);return TRUE;
+        }
+        if (msg==WM_HSCROLL) { updateSliderLabels(dialog); return TRUE; }
         if (msg==SettingsReadyMessage) {
             ShowWindow(dialog,SW_SHOWNORMAL);
+            alignSettingsControls(dialog);
             SetForegroundWindow(dialog);
-            SetFocus(GetDlgItem(dialog,IDC_HOTKEY));
+            SetFocus(GetDlgItem(dialog,app->settingsPage==2 ? IDC_TIMER_HOTKEY : app->settingsPage==1 ? IDC_HOTKEY : IDC_SNAPSHOT_HOTKEY));
             return TRUE;
         }
         if (msg==WM_COMMAND) {
+            if (LOWORD(w)==IDC_TIMER_DELETE) { SendDlgItemMessageW(dialog,IDC_TIMER_HOTKEY,HKM_SETHOTKEY,0,0); return TRUE; }
+            if (LOWORD(w)==IDC_SNAPSHOT_DELETE) { SendDlgItemMessageW(dialog,IDC_SNAPSHOT_HOTKEY,HKM_SETHOTKEY,0,0); return TRUE; }
             if (LOWORD(w)==IDC_DELETE_HOTKEY) {
                 SendDlgItemMessageW(dialog,IDC_HOTKEY,HKM_SETHOTKEY,0,0);
                 SetFocus(GetDlgItem(dialog,IDC_HOTKEY)); return TRUE;
-            }
-            if (LOWORD(w)==IDC_RESET) {
-                SendDlgItemMessageW(dialog,IDC_HOTKEY,HKM_SETHOTKEY,MAKEWORD('2',HOTKEYF_CONTROL),0);
-                return TRUE;
             }
             if (LOWORD(w)==IDOK) {
                 auto value=SendDlgItemMessageW(dialog,IDC_HOTKEY,HKM_GETHOTKEY,0,0);
@@ -885,13 +1064,99 @@ class App {
                 if (flags & HOTKEYF_CONTROL) mods|=MOD_CONTROL;
                 if (flags & HOTKEYF_ALT) mods|=MOD_ALT;
                 if (flags & HOTKEYF_SHIFT) mods|=MOD_SHIFT;
+                auto sv=SendDlgItemMessageW(dialog,IDC_SNAPSHOT_HOTKEY,HKM_GETHOTKEY,0,0);
+                UINT sm=0; auto sf=HIBYTE(sv); UINT sk=LOBYTE(sv);
+                if (sf & HOTKEYF_CONTROL) sm|=MOD_CONTROL;
+                if (sf & HOTKEYF_ALT) sm|=MOD_ALT;
+                if (sf & HOTKEYF_SHIFT) sm|=MOD_SHIFT;
+                int sz=100+25*static_cast<int>(SendDlgItemMessageW(dialog,IDC_SNAPSHOT_ZOOM,TBM_GETPOS,0,0));
+                int width=4+2*static_cast<int>(SendDlgItemMessageW(dialog,IDC_DEFAULT_WIDTH,TBM_GETPOS,0,0));
+                auto tv=SendDlgItemMessageW(dialog,IDC_TIMER_HOTKEY,HKM_GETHOTKEY,0,0);
+                UINT tm=0,tk=LOBYTE(tv);auto tf=HIBYTE(tv);
+                if (tf&HOTKEYF_CONTROL) tm|=MOD_CONTROL;
+                if (tf&HOTKEYF_ALT) tm|=MOD_ALT;
+                if (tf&HOTKEYF_SHIFT) tm|=MOD_SHIFT;
+                BOOL validMinutes{};auto minutes=GetDlgItemInt(dialog,IDC_TIMER_MINUTES,&validMinutes,FALSE);
+                if (!validShortcut(mods,LOBYTE(value)) || !validShortcut(sm,sk) || !validShortcut(tm,tk) ||
+                    (sk && sk==LOBYTE(value) && sm==mods) || (tk && tk==sk && tm==sm) || (tk && tk==LOBYTE(value) && tm==mods)) {
+                    MessageBoxW(dialog,L"请为三个模式设置互不重复的 Ctrl / Alt 组合快捷键。",L"MyZoomIt 设置",MB_OK|MB_ICONWARNING);return TRUE;
+                }
+                if (!validMinutes || minutes<1 || minutes>1440) {
+                    TabCtrl_SetCurSel(GetDlgItem(dialog,IDC_SETTINGS_TABS),2);app->settingsPage=2;selectSettingsTab(dialog,2);
+                    MessageBoxW(dialog,L"倒计时默认时长须为 1–1440 分钟。",L"MyZoomIt 设置",MB_OK|MB_ICONWARNING);SetFocus(GetDlgItem(dialog,IDC_TIMER_MINUTES));return TRUE;
+                }
+                // Release bindings left by an earlier failed save before validating all three.
+                if (app->hotkey) { UnregisterHotKey(app->window,app->hotkeyId);app->hotkey=false; }
+                if (app->snapshotHotkey) { UnregisterHotKey(app->window,3);app->snapshotHotkey=false; }
+                if (app->timerHotkey) { UnregisterHotKey(app->window,4);app->timerHotkey=false; }
+                if (tk && !RegisterHotKey(app->window,4,tm|MOD_NOREPEAT,tk)) {
+                    MessageBoxW(dialog,L"倒计时快捷键已被其他程序占用。",L"MyZoomIt 设置",MB_OK|MB_ICONWARNING);return TRUE;
+                }
+                app->timerHotkey=tk!=0;
+                if (sk && !RegisterHotKey(app->window,3,sm|MOD_NOREPEAT,sk)) {
+                    UnregisterHotKey(app->window,4);app->timerHotkey=false;
+                    MessageBoxW(dialog,L"截图快捷键已被其他程序占用。",L"MyZoomIt 设置",MB_OK|MB_ICONWARNING); return TRUE;
+                }
+                app->snapshotHotkey=sk!=0;
+                // Keep a failed multi-page save from applying only some of the pages.
+                auto oldHotMods=app->hotkeyModifiers,oldHotKey=app->hotkeyKey;
+                auto oldSnapMods=app->snapshotMods,oldSnapKey=app->snapshotKey;
+                int oldZoom=app->initialZoom,oldWidth=app->defaultPenWidth;
+                float oldPenWidth=app->penWidth;bool oldHint=app->showHint,oldStartup=app->runAtStartup;
+                auto oldTimerMods=app->timer.modifiers,oldTimerKey=app->timer.key;
+                int oldTimerMinutes=app->timer.minutes,oldTimerStyle=app->timer.style;bool oldTimerFull=app->timer.defaultFull;
+                BOOL oldEmphasis{};bool haveEmphasis=SystemParametersInfoW(SPI_GETMOUSESONAR,0,&oldEmphasis,0)!=FALSE;
+                std::vector<std::pair<std::wstring,std::wstring>> sections;
+                for (auto name:{L"Hotkey",L"UI",L"Pen",L"Snapshot",L"Timer"}) {
+                    std::wstring contents(32768,L'\0');GetPrivateProfileSectionW(name,contents.data(),static_cast<DWORD>(contents.size()),app->settingsPath.c_str());
+                    sections.emplace_back(name,std::move(contents));
+                }
+                bool committed=false;
+                struct Rollback { std::function<void()> action;~Rollback() { action(); } } rollback{[&] {
+                    if (committed) return;
+                    UnregisterHotKey(app->window,app->hotkeyId);UnregisterHotKey(app->window,3);UnregisterHotKey(app->window,4);
+                    app->hotkey=app->snapshotHotkey=app->timerHotkey=false;
+                    app->hotkeyModifiers=oldHotMods;app->hotkeyKey=oldHotKey;app->snapshotMods=oldSnapMods;app->snapshotKey=oldSnapKey;
+                    app->initialZoom=oldZoom;app->defaultPenWidth=oldWidth;app->showHint=oldHint;app->runAtStartup=oldStartup;
+                    app->timer.modifiers=oldTimerMods;app->timer.key=oldTimerKey;app->timer.minutes=oldTimerMinutes;app->timer.style=oldTimerStyle;app->timer.defaultFull=oldTimerFull;
+                    app->updateWidth(oldPenWidth);
+                    for (auto const& section:sections) WritePrivateProfileSectionW(section.first.c_str(),section.second.c_str(),app->settingsPath.c_str());
+                    std::wstring restoreError;if (app->startupEnabled()!=oldStartup) app->setStartup(oldStartup,restoreError);
+                    if (haveEmphasis) { BOOL current{};if (SystemParametersInfoW(SPI_GETMOUSESONAR,0,&current,0) && current!=oldEmphasis) app->setMouseEmphasis(oldEmphasis!=FALSE); }
+                    app->timer.refresh();
+                }};
                 std::wstring error;
                 if (!app->applySettings(mods,LOBYTE(value),IsDlgButtonChecked(dialog,IDC_SHOW_HINT)==BST_CHECKED,
                     IsDlgButtonChecked(dialog,IDC_STARTUP)==BST_CHECKED,
                     IsWindowEnabled(GetDlgItem(dialog,IDC_MOUSE_EMPHASIS)) ?
                         (IsDlgButtonChecked(dialog,IDC_MOUSE_EMPHASIS)==BST_CHECKED ? 1 : 0) : -1,error)) {
+                    UnregisterHotKey(app->window,4);app->timerHotkey=false;
+                    UnregisterHotKey(app->window,3); app->snapshotHotkey=false;
                     MessageBoxW(dialog,error.c_str(),L"MyZoomIt 设置",MB_OK|MB_ICONWARNING); return TRUE;
                 }
+                std::wstring section=L"Modifiers="+std::to_wstring(sm)+L'\0'+L"Key="+std::to_wstring(sk)+L'\0'+L"Zoom="+std::to_wstring(sz)+L'\0';
+                if (!WritePrivateProfileSectionW(L"Snapshot",section.c_str(),app->settingsPath.c_str())) {
+                    UnregisterHotKey(app->window,4);app->timerHotkey=false;
+                    UnregisterHotKey(app->window,3); app->snapshotHotkey=false;
+                    MessageBoxW(dialog,L"无法保存截图设置。",L"MyZoomIt 设置",MB_OK|MB_ICONWARNING); return TRUE;
+                }
+                app->snapshotMods=sm; app->snapshotKey=sk; app->initialZoom=static_cast<int>(sz);
+                app->defaultPenWidth=width; app->updateWidth(static_cast<float>(width));
+                if (!app->saveBrushSettings()) {
+                    MessageBoxW(dialog,L"无法保存默认笔宽设置。",L"MyZoomIt 设置",MB_OK|MB_ICONWARNING); return TRUE;
+                }
+                auto oldMinutes=app->timer.minutes,oldStyle=app->timer.style;auto oldMods=app->timer.modifiers,oldKey=app->timer.key;bool oldFull=app->timer.defaultFull;
+                app->timer.modifiers=tm;app->timer.key=tk;app->timer.minutes=static_cast<int>(minutes);
+                app->timer.style=static_cast<int>(SendDlgItemMessageW(dialog,IDC_TIMER_STYLE,CB_GETCURSEL,0,0));
+                app->timer.defaultFull=SendDlgItemMessageW(dialog,IDC_TIMER_SHAPE,CB_GETCURSEL,0,0)==0;
+                if (!app->timer.save()) {
+                    app->timer.modifiers=oldMods;app->timer.key=oldKey;app->timer.minutes=oldMinutes;app->timer.style=oldStyle;app->timer.defaultFull=oldFull;
+                    UnregisterHotKey(app->window,4);app->timerHotkey=false;
+                    MessageBoxW(dialog,L"无法保存倒计时设置。",L"MyZoomIt 设置",MB_OK|MB_ICONWARNING);return TRUE;
+                }
+                if (!app->timer.state.started) app->timer.state.remaining=app->timer.state.duration=static_cast<int64_t>(minutes)*60000;
+                app->timer.refresh();
+                committed=true;
                 EndDialog(dialog,IDOK); return TRUE;
             }
             if (LOWORD(w)==IDCANCEL) { EndDialog(dialog,IDCANCEL); return TRUE; }
@@ -900,13 +1165,17 @@ class App {
         if (msg==WM_DESTROY) { app->settingsWindow=nullptr; hotkeyEdit=nullptr; }
         return FALSE;
     }
-    void settings() {
+    void settings(int page=0) {
+        settingsPage=page;
         if (settingsWindow && IsWindow(settingsWindow)) {
+            TabCtrl_SetCurSel(GetDlgItem(settingsWindow,IDC_SETTINGS_TABS),page);selectSettingsTab(settingsWindow,page);
             ShowWindow(settingsWindow,SW_RESTORE); SetForegroundWindow(settingsWindow); return;
         }
         leave();
         // Suspend the binding so the hotkey editor receives the currently registered combination.
         if (hotkey) { UnregisterHotKey(window,hotkeyId); hotkey=false; }
+        if (snapshotHotkey) { UnregisterHotKey(window,3); snapshotHotkey=false; }
+        if (timerHotkey) { UnregisterHotKey(window,4);timerHotkey=false; }
         auto inputHook=SetWindowsHookExW(WH_GETMESSAGE,hotkeyMessageProcedure,nullptr,GetCurrentThreadId());
         auto result=DialogBoxParamW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(IDD_SETTINGS),nullptr,settingsProcedure,reinterpret_cast<LPARAM>(this));
         if (inputHook) UnhookWindowsHookEx(inputHook);
@@ -917,17 +1186,23 @@ class App {
             hotkey=RegisterHotKey(window,hotkeyId,hotkeyModifiers|MOD_NOREPEAT,hotkeyKey)!=FALSE;
             if (!hotkey) MessageBoxW(nullptr,L"快捷键现已被其他程序占用，请在设置中重新选择。",L"MyZoomIt",MB_OK|MB_ICONWARNING);
         }
+        if (!snapshotHotkey && snapshotKey) snapshotHotkey=RegisterHotKey(window,3,snapshotMods|MOD_NOREPEAT,snapshotKey)!=FALSE;
+        if (!timerHotkey && timer.key) timerHotkey=RegisterHotKey(window,4,timer.modifiers|MOD_NOREPEAT,timer.key)!=FALSE;
         if (result==-1) MessageBoxW(nullptr,L"无法打开设置窗口。",L"MyZoomIt",MB_OK|MB_ICONERROR);
     }
 
     void updateHint() {
         hintText.Text(std::wstring(L"标注中  ·  ")+(eraserMode ? L"橡皮擦" : toolName())+L"  ·  "+Palette[colorIndex].name+L"  ·  Ctrl+滚轮 粗细 "+
             std::to_wstring(static_cast<int>(penWidth))+L"  ·  Ctrl+Z 撤销  ·  Ctrl+Y 恢复  ·  E：橡皮擦  ·  C 清空  ·  K 黑板  ·  Esc 返回\n按住 Ctrl 矩形 / Tab 椭圆 / Shift 直线 / Ctrl+Shift 箭头");
+        if (snapshotMode) hintText.Text(browsing ?
+            L"截图浏览 · "+std::to_wstring(static_cast<int>(zoom*100))+L"% · 移动鼠标浏览 · 滚轮缩放 · 点击或触控标注 · Esc 退出并复制" :
+            std::wstring(hintText.Text())+L"\n截图标注：右键返回浏览（保留笔迹）");
         if (hintPanel) hintPanel.Visibility(showHint ? Visibility::Visible : Visibility::Collapsed);
     }
     bool setColor(WORD keyCode) {
         for (size_t i=0;i<Palette.size();++i) {
             if (Palette[i].key!=keyCode) continue;
+            if (eraserMode) { finishErase(); eraserMode=false; cursorTouch=false; }
             colorIndex=i;
             auto attributes=presenter.CopyDefaultDrawingAttributes();
             attributes.Color(Palette[i].value);
@@ -938,7 +1213,7 @@ class App {
     }
 
     void updateWidth(float width) {
-        penWidth=std::clamp(width,6.0f,24.0f);
+        penWidth=std::clamp(width,4.0f,24.0f);
         auto attributes=presenter.CopyDefaultDrawingAttributes();
         attributes.Size({penWidth,penWidth});
         attributes.ModelerAttributes().UseVelocityBasedPressure(false);
@@ -1018,6 +1293,8 @@ class App {
     void leave(bool restore = true) {
         if (!active || changing) return;
         changing = true;
+        stopZoomAnimation();
+        copyFinalScreen();
         cursorAnimating=false; KillTimer(window,CursorTimer);
         if (cursorSurface) cursorSurface.Visibility(Visibility::Collapsed);
         restoreSystemCursor();
@@ -1025,19 +1302,37 @@ class App {
         ShowWindow(window, SW_HIDE);
         normalTaskbarPolicy();
         active = false;
+        resetActivationSurface(false);
+        snapshotMode=false; browsing=false; screenshot.Source(nullptr); screenshot.Visibility(Visibility::Collapsed);
+        viewport.Background(SolidColorBrush(Color{0,0,0,0}));
+        zoom=1; viewX=viewY=0; updateView();
         blackboard.Visibility(Visibility::Collapsed);
         clear(); eraserMode=false; cursorTouch=false;
+        cursorSuppressedByContact=false;
         if (heldTool) { heldTool=false; setTool(Tool::Pen); }
         saveBrushSettings();
         if (restore && IsWindow(previous)) SetForegroundWindow(previous);
         changing = false;
     }
-    void enter() {
+    static double GetDpiForMonitorScale(RECT r) {
+        auto lib=LoadLibraryW(L"shcore.dll"); UINT x=96,y=96;
+        if (lib) {
+            using Fn=HRESULT(WINAPI*)(HMONITOR,int,UINT*,UINT*);
+            auto fn=reinterpret_cast<Fn>(GetProcAddress(lib,"GetDpiForMonitor"));
+            if (fn) fn(MonitorFromRect(&r,MONITOR_DEFAULTTONEAREST),0,&x,&y);
+            FreeLibrary(lib);
+        }
+        return x/96.0;
+    }
+    void enter(bool snapshot=false) {
+        if (timer.isFullscreen()) timer.hide();
         if (settingsWindow) { SetForegroundWindow(settingsWindow); return; }
         if (aboutWindow) { SetForegroundWindow(aboutWindow); return; }
         if (changing) return;
         if (active) { leave(); return; }
         changing = true;
+        updateWidth(static_cast<float>(defaultPenWidth)); zoomWheelRemainder=0;
+        cursorSuppressedByContact=false;
         previous = GetForegroundWindow();
         POINT point{}; GetCursorPos(&point);
         auto next = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
@@ -1051,17 +1346,55 @@ class App {
             // fullscreen assessment of the previous application.
             if (fullscreenOnMonitor(previous,monitor,r)) RemovePropW(window,L"NonRudeHWND");
             else normalTaskbarPolicy();
+            snapshotMode=snapshot; browsing=snapshot;
+            viewport.Background(SolidColorBrush(Color{static_cast<BYTE>(snapshot ? 255 : 0),0,0,0}));
+            zoom=snapshot ? initialZoom/100.0 : 1.0; viewX=viewY=0;
+            double dpi=GetDpiForMonitorScale(r);
+            sceneWidth=(r.right-r.left)/dpi; sceneHeight=(r.bottom-r.top)/dpi;
+            scene.Width(snapshot ? sceneWidth : NAN); scene.Height(snapshot ? sceneHeight : NAN);
+            if (snapshot) {
+                auto bitmap=captureScreen(r);
+                if (!bitmap) throw hresult_error(E_FAIL,L"无法捕获屏幕");
+                Windows::UI::Xaml::Media::Imaging::WriteableBitmap image(r.right-r.left,r.bottom-r.top);
+                try {
+                    auto buffer=image.PixelBuffer(); auto access=buffer.as<PixelBufferAccess>();
+                    BYTE* bytes{}; check_hresult(access->Buffer(&bytes));
+                    BITMAPINFO bi{}; bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+                    bi.bmiHeader.biWidth=r.right-r.left; bi.bmiHeader.biHeight=-(r.bottom-r.top);
+                    bi.bmiHeader.biPlanes=1; bi.bmiHeader.biBitCount=32; bi.bmiHeader.biCompression=BI_RGB;
+                    auto dc=GetDC(nullptr);
+                    int rows=GetDIBits(dc,bitmap,0,r.bottom-r.top,bytes,&bi,DIB_RGB_COLORS); ReleaseDC(nullptr,dc);
+                    if (rows!=r.bottom-r.top) throw hresult_error(E_FAIL);
+                    for (uint32_t i=3;i<buffer.Length();i+=4) bytes[i]=255;
+                    image.Invalidate(); screenshot.Source(image);
+                } catch (...) { DeleteObject(bitmap); throw; }
+                DeleteObject(bitmap); screenshot.Visibility(Visibility::Visible);
+            }
+            updateView();
             blackboard.Visibility(Visibility::Collapsed);
             SetWindowPos(window, HWND_TOPMOST, r.left, r.top, r.right-r.left, r.bottom-r.top, 0);
             presenter.IsInputEnabled(tool==Tool::Pen);
             active = true;
-            updateHint(); syncHeldTool();
+            updateHint(); if (!snapshot) syncHeldTool();
             ShowWindow(window, SW_SHOW);
             SetForegroundWindow(window);
             SetFocus(island);
             hideSystemCursor();
-            cursorStarted=GetTickCount64(); cursorAnimating=true;
+            cursorAnimationStart=200; cursorStarted=GetTickCount64(); cursorAnimating=true;
             animateCursor(); SetTimer(window,CursorTimer,16,nullptr);
+            if (snapshot) {
+                browseMove(true); returnToBrowse();
+                POINT anchor{}; GetCursorPos(&anchor); ScreenToClient(island,&anchor);
+                double actualDpi=GetDpiForWindow(island)/96.0;
+                zoomAnchorX=anchor.x/actualDpi; zoomAnchorY=anchor.y/actualDpi;
+                zoomTarget=zoom;
+                if (zoomTarget>1) {
+                    zoom=1; viewX=viewY=0; updateView();
+                    zoomStarted=GetTickCount64(); zoomAnimating=true;
+                    SetTimer(window,ZoomTimer,16,nullptr);
+                }
+            }
+            timer.raiseFloating();
             changing = false;
         } catch (...) {
             changing = false;
@@ -1069,6 +1402,33 @@ class App {
             normalTaskbarPolicy();
             throw;
         }
+    }
+    static INT_PTR aboutContentProcedure(HWND dialog,UINT msg,WPARAM w,LPARAM l) {
+        if (msg==WM_DRAWITEM && w==IDC_COFFEE_IMAGE) {
+            auto item=reinterpret_cast<DRAWITEMSTRUCT*>(l);
+            auto bitmap=static_cast<HBITMAP>(LoadImageW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(IDB_COFFEE),IMAGE_BITMAP,0,0,LR_CREATEDIBSECTION));
+            if (bitmap) {
+                BITMAP info{}; GetObjectW(bitmap,sizeof(info),&info);
+                auto memory=CreateCompatibleDC(item->hDC); auto old=SelectObject(memory,bitmap);
+                int mode=SetStretchBltMode(item->hDC,COLORONCOLOR);
+                StretchBlt(item->hDC,0,0,item->rcItem.right,item->rcItem.bottom,memory,0,0,info.bmWidth,info.bmHeight,SRCCOPY);
+                SetStretchBltMode(item->hDC,mode); SelectObject(memory,old); DeleteDC(memory); DeleteObject(bitmap);
+            }
+            return TRUE;
+        }
+        if (msg==WM_NOTIFY) {
+            auto notification=reinterpret_cast<NMHDR*>(l);
+            if (notification->code==NM_CLICK || notification->code==NM_RETURN) {
+                const wchar_t* target=notification->idFrom==IDC_PROJECT_LINK ? L"https://github.com/Algustav/myZoomit" :
+                    notification->idFrom==IDC_CREDITS_LINK ? L"https://github.com/steveruizok/perfect-freehand" :
+                    notification->idFrom==IDC_CONTACT_LINK ? L"mailto:mail@ganlei.com" : nullptr;
+                if (!target) return FALSE;
+                if (reinterpret_cast<INT_PTR>(ShellExecuteW(dialog,L"open",target,nullptr,nullptr,SW_SHOWNORMAL))<=32)
+                    MessageBoxW(dialog,L"无法打开链接，请检查默认浏览器或邮件应用。",L"myZoomit",MB_OK|MB_ICONWARNING);
+                return TRUE;
+            }
+        }
+        return FALSE;
     }
     static INT_PTR CALLBACK aboutProcedure(HWND dialog, UINT msg, WPARAM w, LPARAM l) {
         auto app=reinterpret_cast<App*>(GetWindowLongPtrW(dialog,DWLP_USER));
@@ -1095,31 +1455,9 @@ class App {
             PostMessageW(dialog,SettingsReadyMessage,0,0); return TRUE;
         }
         if (!app) return FALSE;
-        if (msg==WM_DRAWITEM && w==IDC_COFFEE_IMAGE) {
-            auto item=reinterpret_cast<DRAWITEMSTRUCT*>(l);
-            auto bitmap=static_cast<HBITMAP>(LoadImageW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(IDB_COFFEE),IMAGE_BITMAP,0,0,LR_CREATEDIBSECTION));
-            if (bitmap) {
-                BITMAP info{}; GetObjectW(bitmap,sizeof(info),&info);
-                auto memory=CreateCompatibleDC(item->hDC); auto old=SelectObject(memory,bitmap);
-                int mode=SetStretchBltMode(item->hDC,COLORONCOLOR);
-                StretchBlt(item->hDC,0,0,item->rcItem.right,item->rcItem.bottom,memory,0,0,info.bmWidth,info.bmHeight,SRCCOPY);
-                SetStretchBltMode(item->hDC,mode); SelectObject(memory,old); DeleteDC(memory); DeleteObject(bitmap);
-            }
-            return TRUE;
-        }
+        if (aboutContentProcedure(dialog,msg,w,l)) return TRUE;
         if (msg==SettingsReadyMessage) {
             ShowWindow(dialog,SW_SHOWNORMAL); SetForegroundWindow(dialog); SetFocus(GetDlgItem(dialog,IDOK)); return TRUE;
-        }
-        if (msg==WM_NOTIFY) {
-            auto notification=reinterpret_cast<NMHDR*>(l);
-            if (notification->code==NM_CLICK || notification->code==NM_RETURN) {
-                const wchar_t* target=notification->idFrom==IDC_PROJECT_LINK ? L"https://github.com/Algustav/myZoomit" :
-                    notification->idFrom==IDC_CREDITS_LINK ? L"https://github.com/steveruizok/perfect-freehand" :
-                    notification->idFrom==IDC_CONTACT_LINK ? L"mailto:mail@ganlei.com" : nullptr;
-                if (target && reinterpret_cast<INT_PTR>(ShellExecuteW(dialog,L"open",target,nullptr,nullptr,SW_SHOWNORMAL))<=32)
-                    MessageBoxW(dialog,L"无法打开链接，请检查默认浏览器或邮件应用。",L"myZoomit",MB_OK|MB_ICONWARNING);
-                return TRUE;
-            }
         }
         if (msg==WM_COMMAND && (LOWORD(w)==IDOK || LOWORD(w)==IDCANCEL)) { EndDialog(dialog,LOWORD(w)); return TRUE; }
         if (msg==WM_CLOSE) { EndDialog(dialog,IDCANCEL); return TRUE; }
@@ -1137,8 +1475,6 @@ class App {
     }
     void menu() {
         auto popup = CreatePopupMenu();
-        auto label=L"开始 / 结束标注\t"+shortcutText();
-        AppendMenuW(popup, MF_STRING, 1, label.c_str());
         AppendMenuW(popup, MF_STRING, 4, L"设置…");
         AppendMenuW(popup, MF_STRING, 5, L"关于…");
         AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
@@ -1149,8 +1485,7 @@ class App {
             point.x, point.y, 0, window, nullptr);
         DestroyMenu(popup);
         PostMessageW(window, WM_NULL, 0, 0);
-        if (command == 1) enter();
-        else if (command == 3) PostMessageW(window, WM_CLOSE, 0, 0);
+        if (command == 3) PostMessageW(window, WM_CLOSE, 0, 0);
         else if (command == 4) PostMessageW(window,SettingsMessage,0,0);
         else if (command == 5) PostMessageW(window,AboutMessage,0,0);
     }
@@ -1176,24 +1511,26 @@ class App {
         case ActivateMessage: if (!active) enter(); return 0;
         case SettingsMessage: settings(); return 0;
         case AboutMessage: about(); return 0;
-        case WM_HOTKEY: if (hotkey && !settingsWindow && !aboutWindow && static_cast<int>(w)==hotkeyId) enter(); return 0;
+        case WM_APP+7: timerSettings(); return 0;
+        case WM_HOTKEY: if (timer.settingsOpen()) return 0; if (w==4 && timerHotkey && !settingsWindow && !aboutWindow) { timer.toggle(); return 0; } if (snapshotHotkey && w==3 && !settingsWindow && !aboutWindow) { enter(true); return 0; } if (hotkey && !settingsWindow && !aboutWindow && static_cast<int>(w)==hotkeyId) enter(); return 0;
         case WM_SIZE:
             if (island) SetWindowPos(island, nullptr, 0, 0, LOWORD(l), HIWORD(l), SWP_NOZORDER | SWP_NOACTIVATE);
             return 0;
         case WM_ERASEBKGND: return 1;
-        case WM_ACTIVATE: if (LOWORD(w) == WA_INACTIVE) leave(false); return 0;
+        case WM_ACTIVATE: if (LOWORD(w) == WA_INACTIVE && !timer.owns(reinterpret_cast<HWND>(l))) leave(false); return 0;
         case WM_DISPLAYCHANGE: case WM_DPICHANGED: leave(false); monitor = nullptr; clear(); return 0;
-        case WM_WTSSESSION_CHANGE: if (w == WTS_SESSION_LOCK) leave(false); return 0;
+        case WM_WTSSESSION_CHANGE: if (w == WTS_SESSION_LOCK) { leave(false); timer.hide(); } return 0;
         case TrayMessage:
             if (l == WM_LBUTTONUP || l == WM_RBUTTONUP) menu();
             return 0;
-        case WM_SETCURSOR: if (active) { SetCursor(nullptr); return TRUE; } break;
-        case WM_TIMER: if (w==CursorTimer) animateCursor(); return 0;
-        case WM_CLOSE: saveBrushSettings(); if (settingsWindow) EndDialog(settingsWindow,IDCANCEL); if (aboutWindow) EndDialog(aboutWindow,IDCANCEL); leave(); DestroyWindow(window); return 0;
+        case WM_SETCURSOR: if (active && !browsing) { SetCursor(nullptr); return TRUE; } break;
+        case WM_TIMER: if (w==CursorTimer) animateCursor(); else if (w==ZoomTimer) animateZoom(); return 0;
+        case WM_CLOSE: timer.hide(); saveBrushSettings(); if (settingsWindow) EndDialog(settingsWindow,IDCANCEL); if (aboutWindow) EndDialog(aboutWindow,IDCANCEL); leave(); DestroyWindow(window); return 0;
         case WM_DESTROY:
             KillTimer(window,CursorTimer);
+            KillTimer(window,ZoomTimer);
             restoreSystemCursor();
-            UnregisterHotKey(window, hotkeyId);
+            UnregisterHotKey(window, hotkeyId); UnregisterHotKey(window,3); UnregisterHotKey(window,4);
             WTSUnRegisterSessionNotification(window);
             { NOTIFYICONDATAW icon{sizeof(icon)}; icon.hWnd=window; icon.uID=1; Shell_NotifyIconW(NIM_DELETE, &icon); }
             PostQuitMessage(0); return 0;
@@ -1202,7 +1539,7 @@ class App {
     }
 public:
     int run(HINSTANCE instance) {
-        INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_HOTKEY_CLASS|ICC_LINK_CLASS};
+        INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_HOTKEY_CLASS|ICC_LINK_CLASS|ICC_BAR_CLASSES|ICC_TAB_CLASSES};
         if (!InitCommonControlsEx(&controls)) throw hresult_error(HRESULT_FROM_WIN32(GetLastError()));
         loadSettings();
         WNDCLASSW wc{}; wc.lpfnWndProc=procedure; wc.hInstance=instance;
@@ -1225,6 +1562,52 @@ public:
         check_hresult(native->get_WindowHandle(&island));
         Grid root;
         root.Background(SolidColorBrush(Color{0,0,0,0}));
+        scene=root; viewTransform=CompositeTransform(); scene.RenderTransform(viewTransform);
+        viewport=Grid(); viewport.Background(SolidColorBrush(Color{0,0,0,0}));
+        viewport.Children().Append(scene);
+        // A separate hit-test surface keeps the activation contact away from
+        // Ink's independent input thread, including the entire initial drag.
+        activationSurface=Grid();
+        activationSurface.Background(SolidColorBrush(Color{0,0,0,0}));
+        activationSurface.Visibility(Visibility::Collapsed);
+        viewport.Children().Append(activationSurface);
+        activationSurface.PointerPressed([this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
+            if (!active || !snapshotMode) return;
+            args.Handled(true);
+            auto point=args.GetCurrentPoint(activationSurface);
+            bool mouse=point.PointerDevice().PointerDeviceType()==Windows::Devices::Input::PointerDeviceType::Mouse;
+            if (point.Properties().IsRightButtonPressed() ||
+                (mouse ? !point.Properties().IsLeftButtonPressed() : !point.IsInContact())) return;
+            auto id=args.Pointer().PointerId();
+            if (std::find(activationPointers.begin(),activationPointers.end(),id)==activationPointers.end())
+                activationPointers.push_back(id);
+            activationSurface.CapturePointer(args.Pointer());
+            observeCursorInput(point.PointerDevice().PointerDeviceType(),point.IsInContact());
+            beginAnnotation();
+        });
+        activationSurface.PointerMoved([this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
+            auto point=args.GetCurrentPoint(activationSurface);
+            observeCursorInput(point.PointerDevice().PointerDeviceType(),point.IsInContact());
+            if (active && snapshotMode && browsing && args.GetCurrentPoint(activationSurface).PointerDevice().PointerDeviceType()==Windows::Devices::Input::PointerDeviceType::Mouse)
+                browseMove();
+            args.Handled(true);
+        });
+        activationSurface.PointerWheelChanged([this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
+            if (active && snapshotMode && browsing) browseWheel(args.GetCurrentPoint(activationSurface).Properties().MouseWheelDelta());
+            args.Handled(true);
+        });
+        activationSurface.PointerReleased([this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
+            args.Handled(true); releaseActivationPointer(args.Pointer().PointerId());
+            activationSurface.ReleasePointerCapture(args.Pointer());
+        });
+        activationSurface.PointerCanceled([this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
+            releaseActivationPointer(args.Pointer().PointerId());
+        });
+        activationSurface.PointerCaptureLost([this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
+            releaseActivationPointer(args.Pointer().PointerId());
+        });
+        screenshot=Image(); screenshot.Stretch(Stretch::Fill); screenshot.IsHitTestVisible(false);
+        screenshot.Visibility(Visibility::Collapsed); root.Children().Append(screenshot);
         blackboard=Border();
         blackboard.Background(SolidColorBrush(Color{255,0,0,0}));
         blackboard.IsHitTestVisible(false);
@@ -1241,24 +1624,40 @@ public:
             if (!active) { clear(); return; }
             finishErase();
             for (auto const& stroke:args.Strokes()) rememberInk(stroke);
+            presenter.StrokeContainer().Clear();
         });
-        presenter.StrokesErased([this](auto const&, InkStrokesErasedEventArgs const& args) {
-            finishErase();
-            std::vector<UndoItem> removed;
-            for (auto const& stroke:args.Strokes()) {
-                auto found=std::find_if(drawingOrder.begin(),drawingOrder.end(),[&](auto const& item) { return !item.freehandStroke && item.inkId==stroke.Id(); });
-                if (found!=drawingOrder.end()) { removed.push_back(*found); drawingOrder.erase(found); }
-            }
-            recordEdit({false,std::move(removed)});
-        });
-        root.Children().Append(canvas);
+        root.AddHandler(UIElement::PointerPressedEvent(),box_value(XamlInput::PointerEventHandler(
+            [this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
+                auto cursorPoint=args.GetCurrentPoint(scene);
+                observeCursorInput(cursorPoint.PointerDevice().PointerDeviceType(),cursorPoint.IsInContact());
+                if (!active || !snapshotMode) return;
+                auto point=args.GetCurrentPoint(scene);
+                if (point.Properties().IsRightButtonPressed()) {
+                    if (!browsing) returnToBrowse();
+                    args.Handled(true); return;
+                }
+                bool mouse=point.PointerDevice().PointerDeviceType()==Windows::Devices::Input::PointerDeviceType::Mouse;
+                if ((mouse && point.Properties().IsLeftButtonPressed()) || (!mouse && point.IsInContact())) beginAnnotation();
+            })),true);
+        root.AddHandler(UIElement::RightTappedEvent(),box_value(XamlInput::RightTappedEventHandler(
+            [this](auto const&, XamlInput::RightTappedRoutedEventArgs const& args) {
+                if (!active || !snapshotMode) return;
+                if (!browsing) returnToBrowse();
+                args.Handled(true);
+            })),true);
         initializeFreehand(root);
+        // Live native pen ink sits above every completed stroke. Completed native
+        // strokes move to the shared layer without replacing Ink's renderer.
+        root.Children().Append(canvas);
         initializeShapes(root);
         root.AddHandler(UIElement::PointerPressedEvent(),box_value(XamlInput::PointerEventHandler(
             [this](auto const&, auto const&) { if (active && cursorAnimating) finishCursorAnimation(); })),true);
         root.AddHandler(UIElement::PointerWheelChangedEvent(),box_value(XamlInput::PointerEventHandler(
             [this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
-                if (active && (args.KeyModifiers() & Windows::System::VirtualKeyModifiers::Control) != Windows::System::VirtualKeyModifiers::None) {
+                if (active && snapshotMode && browsing) {
+                    browseWheel(args.GetCurrentPoint(scene).Properties().MouseWheelDelta());
+                    args.Handled(true);
+                } else if (active && (args.KeyModifiers() & Windows::System::VirtualKeyModifiers::Control) != Windows::System::VirtualKeyModifiers::None) {
                     wheel(args.GetCurrentPoint(canvas).Properties().MouseWheelDelta());
                     args.Handled(true);
                 }
@@ -1285,29 +1684,95 @@ public:
         root.AddHandler(UIElement::PointerMovedEvent(),box_value(XamlInput::PointerEventHandler(
             [this](auto const&, XamlInput::PointerRoutedEventArgs const& args) {
                 auto point=args.GetCurrentPoint(freehandInputRoot);
-                if (eraserMode && (!erasing || args.Pointer().PointerId()==eraserPointer)) {
+                observeCursorInput(point.PointerDevice().PointerDeviceType(),point.IsInContact());
+                if (active && snapshotMode && browsing && point.PointerDevice().PointerDeviceType()==Windows::Devices::Input::PointerDeviceType::Mouse) {
+                    browseMove(); return;
+                }
+                if (!cursorAnimating && eraserMode && (!erasing || args.Pointer().PointerId()==eraserPointer)) {
                     cursorTouch=point.PointerDevice().PointerDeviceType()==Windows::Devices::Input::PointerDeviceType::Touch;
                     if (cursorTouch) eraserPosition=point.Position();
                     refreshCursor(penWidth);
                 } else positionCursor();
             })),true);
-        source.Content(root);
+        // Status remains in screen coordinates while the drawing scene moves.
+        root.Children().RemoveAt(root.Children().Size()-2);
+        viewport.Children().Append(hint);
+        source.Content(viewport);
         // Ink uses an independent input thread and cursor, separate from CoreWindow's cursor.
         inkInput=Windows::UI::Input::Inking::Core::CoreInkIndependentInputSource::Create(presenter);
         inkInput.PointerEntering([this](auto const& input, auto const&) {
             // This setter must execute on Ink's input thread, not the XAML UI thread.
             input.PointerCursor(nullptr);
         });
+        auto dispatcher=root.Dispatcher();
+        inkInput.PointerPressing([this,dispatcher](auto const&, auto const& args) {
+            auto point=args.CurrentPoint();
+            dispatcher.RunAsync(Windows::UI::Core::CoreDispatcherPriority::High,[this] {
+                observeCursorInput(Windows::Devices::Input::PointerDeviceType::Pen,true);
+                beginAnnotation();
+            });
+            if (!point.Properties().IsEraser()) return;
+            auto position=point.Position(); auto id=point.PointerId();
+            dispatcher.RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal,[this,position,id] {
+                if (!active || drawingFreehand || drawingShape || erasing) return;
+                cursorAnimating=false; penTipEraser=true; erasing=true; eraserPointer=id;
+                eraserPrevious=eraserPosition=position; refreshCursor(penWidth);
+                eraseTo(position);
+            });
+        });
+        inkInput.PointerMoving([this,dispatcher](auto const&, auto const& args) {
+            auto point=args.CurrentPoint();
+            if (point.IsInContact()) dispatcher.RunAsync(Windows::UI::Core::CoreDispatcherPriority::High,[this] {
+                observeCursorInput(Windows::Devices::Input::PointerDeviceType::Pen,true);
+            });
+            if (!point.Properties().IsEraser() || !point.IsInContact()) return;
+            auto position=point.Position(); auto id=point.PointerId();
+            dispatcher.RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal,[this,position,id] {
+                if (active && erasing && eraserPointer==id) eraseTo(position);
+            });
+        });
+        inkInput.PointerReleasing([this,dispatcher](auto const&, auto const& args) {
+            auto point=args.CurrentPoint(); auto position=point.Position(); auto id=point.PointerId();
+            dispatcher.RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal,[this,position,id] {
+                if (active && erasing && eraserPointer==id) { eraseTo(position); finishErase(); }
+            });
+        });
+        inkInput.PointerLost([this,dispatcher](auto const&, auto const& args) {
+            auto id=args.CurrentPoint().PointerId();
+            dispatcher.RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal,[this,id] {
+                if (erasing && eraserPointer==id) finishErase();
+            });
+        });
         Window::Current().CoreWindow().PointerCursor(nullptr);
         SetWindowPos(island,nullptr,0,0,800,600,SWP_NOZORDER | SWP_SHOWWINDOW | SWP_NOACTIVATE);
+        timer.initialize(window,settingsPath);
+        timer.beforeFullscreen=[this] { leave(); };
+        if (!validShortcut(timer.modifiers,timer.key)) { timer.modifiers=MOD_CONTROL; timer.key='3'; }
+        timerHotkey=timer.key && RegisterHotKey(window,4,timer.modifiers|MOD_NOREPEAT,timer.key)!=FALSE;
+        if (timer.key && !timerHotkey) MessageBoxW(nullptr,L"计时快捷键已被占用，请在计时设置中修改。",L"MyZoomIt",MB_OK|MB_ICONWARNING);
         taskbarCreated=RegisterWindowMessageW(L"TaskbarCreated"); tray();
         hotkey=hotkeyKey && RegisterHotKey(window,hotkeyId,hotkeyModifiers | MOD_NOREPEAT,hotkeyKey) != FALSE;
+        snapshotHotkey=snapshotKey && RegisterHotKey(window,3,snapshotMods|MOD_NOREPEAT,snapshotKey)!=FALSE;
+        if (snapshotKey && !snapshotHotkey) MessageBoxW(nullptr,L"截图快捷键已被占用，请在设置中修改。",L"MyZoomIt",MB_OK|MB_ICONWARNING);
         WTSRegisterSessionNotification(window,NOTIFY_FOR_THIS_SESSION);
-        if (hotkeyKey && !hotkey) MessageBoxW(nullptr,(shortcutText()+L" 已被占用。请通过托盘开始标注，或在设置中修改快捷键。").c_str(),L"MyZoomIt",MB_OK | MB_ICONWARNING);
+        if (hotkeyKey && !hotkey) MessageBoxW(nullptr,(shortcutText()+L" 已被占用。请通过托盘打开设置，修改快捷键。").c_str(),L"MyZoomIt",MB_OK | MB_ICONWARNING);
         MSG msg{};
         int status;
         while ((status=GetMessageW(&msg,nullptr,0,0)) > 0) {
-            if (active && (msg.message==WM_KEYDOWN || msg.message==WM_KEYUP) &&
+            if (timer.owns(msg.hwnd)) {
+                restoreSystemCursor();
+                if (cursorSurface) cursorSurface.Visibility(Visibility::Collapsed);
+                TranslateMessage(&msg); DispatchMessageW(&msg); continue;
+            }
+            bool ownInput=msg.hwnd==window || IsChild(window,msg.hwnd);
+            if (active && snapshotMode && ownInput) {
+                if (msg.message==WM_RBUTTONDOWN || msg.message==WM_RBUTTONUP) {
+                    if (msg.message==WM_RBUTTONDOWN && !browsing) returnToBrowse();
+                    continue;
+                }
+                if (msg.message==WM_MOUSEWHEEL && browsing) { browseWheel(GET_WHEEL_DELTA_WPARAM(msg.wParam)); continue; }
+            }
+            if (active && !browsing && (msg.message==WM_KEYDOWN || msg.message==WM_KEYUP) &&
                 (msg.wParam==VK_CONTROL || msg.wParam==VK_SHIFT || msg.wParam==VK_TAB ||
                  msg.wParam==VK_LCONTROL || msg.wParam==VK_RCONTROL || msg.wParam==VK_LSHIFT || msg.wParam==VK_RSHIFT)) {
                 syncHeldTool();
@@ -1317,6 +1782,7 @@ public:
             if (active && msg.message == WM_MOUSEWHEEL && (GetKeyState(VK_CONTROL)&0x8000)) {
                 wheel(GET_WHEEL_DELTA_WPARAM(msg.wParam)); continue;
             }
+            if (active && browsing && msg.message==WM_KEYDOWN && msg.wParam!=VK_ESCAPE) continue;
             if (active && msg.message == WM_KEYDOWN && (msg.hwnd == window || IsChild(window,msg.hwnd))) {
                 if (msg.wParam=='K' && !(GetKeyState(VK_CONTROL)&0x8000) &&
                     !(GetKeyState(VK_MENU)&0x8000) && !(GetKeyState(VK_SHIFT)&0x8000) &&
@@ -1326,7 +1792,14 @@ public:
                         blackboard.Visibility(blackboard.Visibility()==Visibility::Visible ? Visibility::Collapsed : Visibility::Visible);
                     continue;
                 }
-                if (msg.wParam == VK_ESCAPE) { leave(); continue; }
+                if (msg.wParam == VK_ESCAPE) {
+                    // Ignore repeats so one held Escape cannot both restore the
+                    // brush and immediately exit annotation mode.
+                    if (!(msg.lParam & (static_cast<LPARAM>(1)<<30))) {
+                        if (eraserMode && !browsing) toggleEraser(); else leave();
+                    }
+                    continue;
+                }
                 if (msg.wParam == 'Z' && (GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_MENU)&0x8000)) { undo(); continue; }
                 if (msg.wParam == 'Y' && (GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_MENU)&0x8000)) { redo(); continue; }
                 if (msg.wParam=='E' && !(GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_MENU)&0x8000) && !(GetKeyState(VK_SHIFT)&0x8000)) {
@@ -1339,16 +1812,17 @@ public:
                 if (!(GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_MENU)&0x8000) && setColor(static_cast<WORD>(msg.wParam))) continue;
                 if (msg.wParam == 'C') { clear(false); continue; }
             }
-            if (active && msg.message==WM_SETCURSOR && (msg.hwnd==window || IsChild(window,msg.hwnd))) {
+            if (active && !browsing && msg.message==WM_SETCURSOR && (msg.hwnd==window || IsChild(window,msg.hwnd))) {
                 SetCursor(nullptr); continue;
             }
             if (active && cursorAnimating && (msg.message==WM_LBUTTONDOWN || msg.message==WM_POINTERDOWN)) finishCursorAnimation();
             BOOL handled=FALSE; check_hresult(native->PreTranslateMessage(&msg,&handled));
             if (!handled) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-            if (active) hideSystemCursor();
+            if (active && !browsing) hideSystemCursor();
         }
         cancelFreehand(); freehandSurface=nullptr; freehandInputRoot=nullptr; drawingOrder.clear(); undoHistory.clear(); redoHistory.clear(); liveContours.reset();
         cursorDot=nullptr; cursorRing=nullptr; cursorSurface=nullptr; inkInput=nullptr; presenter=nullptr; canvas=nullptr; blackboard=nullptr; hintText=nullptr; hintPanel=nullptr; preview=nullptr; shapeSurface=nullptr; source.Content(nullptr); native=nullptr;
+        screenshot=nullptr; scene=nullptr; viewTransform=nullptr; viewport=nullptr; activationSurface=nullptr;
         source.Close(); source=nullptr; manager.Close(); manager=nullptr;
         return status==-1 ? 1 : static_cast<int>(msg.wParam);
     }

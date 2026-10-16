@@ -10,7 +10,7 @@ pushd "%~dp0.."
 if not exist build mkdir build
 rc /nologo /fo build\settings.res src\settings.rc
 if errorlevel 1 exit /b 1
-cl /nologo /utf-8 /std:c++20 /EHsc /W4 /O2 /MT /DUNICODE /D_UNICODE src\main.cpp build\settings.res /Fo:build\main.obj /Fe:build\MyZoomIt.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:src\app.manifest windowsapp.lib user32.lib shell32.lib dwmapi.lib wtsapi32.lib ole32.lib gdi32.lib comctl32.lib advapi32.lib > build\build.log 2>&1
+cl /nologo /utf-8 /std:c++20 /EHsc /W4 /O2 /MT /DUNICODE /D_UNICODE src\main.cpp build\settings.res /Fo:build\main.obj /Fe:build\MyZoomIt.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:src\app.manifest windowsapp.lib user32.lib shell32.lib dwmapi.lib wtsapi32.lib ole32.lib gdi32.lib comctl32.lib advapi32.lib gdiplus.lib > build\build.log 2>&1
 set "TASK_RESULT=%ERRORLEVEL%"
 type build\build.log
 popd
